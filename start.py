@@ -15,6 +15,7 @@ from datetime import datetime
 HTML_FILE = "Router_update_v2.html"
 PORT = 80
 CAPTIVE_PORTAL_SSID = ""
+AP_STATIC_IP = "192.168.1.1/24"
 
 # ==================== HTTP SERVER CLASS ====================
 class CaptivePortalHandler(BaseHTTPRequestHandler):
@@ -227,6 +228,45 @@ def start_captive_portal(interface, ssid):
         print(f"\n❌ Error starting server: {e}")
         sys.exit(1)
 
+def get_default_interface():
+    """Return the interface used for the default route (Linux)."""
+    if not sys.platform.startswith('linux'):
+        return None
+    try:
+        result = subprocess.run(
+            ['ip', 'route', 'show', 'default'],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if 'dev' in parts:
+                return parts[parts.index('dev') + 1]
+    except (subprocess.CalledProcessError, IndexError):
+        return None
+    return None
+
+def get_interface_for_ip(ip_address):
+    """Return interface name for a given local IP."""
+    for iface in netifaces.interfaces():
+        ip_info = netifaces.ifaddresses(iface).get(netifaces.AF_INET, [])
+        for addr in ip_info:
+            if addr.get('addr') == ip_address:
+                return iface
+    return None
+
+def is_interface_used_for_ssh(interface):
+    """Check if the interface appears to be used for the current SSH session."""
+    ssh_conn = os.environ.get('SSH_CONNECTION')
+    if not ssh_conn:
+        return False
+    parts = ssh_conn.split()
+    if len(parts) < 3:
+        return False
+    local_ip = parts[2]
+    return get_interface_for_ip(local_ip) == interface
+
 def setup_wifi_ap(interface, ssid):
     """Configure interface as access point (Linux with hostapd)"""
     if not sys.platform.startswith('linux'):
@@ -244,15 +284,29 @@ def setup_wifi_ap(interface, ssid):
         print("\n❌ hostapd or dnsmasq not installed!")
         print("   Install with: sudo apt-get install hostapd dnsmasq")
         return False
+
+    default_iface = get_default_interface()
+    if default_iface == interface:
+        print(f"\n❌ Safety check: {interface} is the default route interface.")
+        print("   Configuring it as an AP would drop your SSH connection.")
+        print("   Use a different interface for the access point.")
+        return False
+
+    if is_interface_used_for_ssh(interface):
+        print(f"\n❌ Safety check: {interface} appears to be used for SSH.")
+        print("   Configuring it as an AP would drop your SSH connection.")
+        print("   Use a different interface for the access point.")
+        return False
     
     try:
-        # Stop NetworkManager
-        subprocess.run(['sudo', 'systemctl', 'stop', 'NetworkManager'], 
-                      capture_output=True)
+        # Detach interface from NetworkManager if available (avoid stopping NM)
+        if subprocess.run(['which', 'nmcli'], capture_output=True).returncode == 0:
+            subprocess.run(['sudo', 'nmcli', 'dev', 'set', interface, 'managed', 'no'],
+                           capture_output=True)
         
         # Set static IP
         subprocess.run(['sudo', 'ip', 'addr', 'flush', 'dev', interface])
-        subprocess.run(['sudo', 'ip', 'addr', 'add', '192.168.1.1/24', 'dev', interface])
+        subprocess.run(['sudo', 'ip', 'addr', 'add', AP_STATIC_IP, 'dev', interface])
         subprocess.run(['sudo', 'ip', 'link', 'set', interface, 'up'])
         
         # Create hostapd config
@@ -292,8 +346,12 @@ log-dhcp
         
         # Enable packet forwarding
         subprocess.run(['sudo', 'sysctl', '-w', 'net.ipv4.ip_forward=1'])
-        subprocess.run(['sudo', 'iptables', '-t', 'nat', '-A', 'POSTROUTING', 
-                       '-o', 'eth0', '-j', 'MASQUERADE'])
+        if default_iface:
+            subprocess.run(['sudo', 'iptables', '-t', 'nat', '-A', 'POSTROUTING',
+                           '-o', default_iface, '-j', 'MASQUERADE'])
+        else:
+            print("⚠️  Could not determine default route interface for NAT.")
+            print("   Internet access for clients may not work.")
         
         print("✅ Hotspot configured!")
         return True
