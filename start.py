@@ -242,24 +242,12 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         print(f"[{datetime.now()}] GET request from {self.client_address[0]} to {self.path}")
 
         # Always display login page regardless of path (improves captive portal reach)
-        html_content = PORTAL_HTML or EMBEDDED_PORTAL_HTML
-        
-        if self.path not in ("/", f"/{HTML_FILE}"):
-            self.send_response(302)
-            self.send_header("Location", "/")
-            self.end_headers()
-            return
+        html_content = PORTAL_HTML or load_portal_html()
 
-        # Always display login page
-        try:
-            with open(HTML_FILE, 'r', encoding='utf-8') as f:
-                html_content = f.read()
-        except FileNotFoundError:
-            print(f"[{datetime.now()}] ERROR: HTML file not found: {HTML_FILE}")
-            html_content = "<html><body><h1>Error: Portal page not found</h1></body></html>"
-        
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma', 'no-cache')
         self.send_header('Content-Length', len(html_content.encode('utf-8')))
         self.end_headers()
         self.wfile.write(html_content.encode('utf-8'))
