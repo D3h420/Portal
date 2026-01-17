@@ -9,6 +9,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 import time
 import socket
+import ipaddress
 from datetime import datetime
 from urllib.parse import parse_qs
 
@@ -409,6 +410,28 @@ def load_portal_html():
     print(f"[{datetime.now()}] Using embedded HTML (missing or unreadable {HTML_FILE}).")
     return EMBEDDED_PORTAL_HTML
 
+def get_ap_ip_address():
+    """Return the AP IP address (without CIDR suffix)."""
+    try:
+        return str(ipaddress.ip_interface(AP_STATIC_IP).ip)
+    except ValueError:
+        return AP_STATIC_IP.split('/')[0]
+
+def add_captive_portal_iptables_rules(interface, portal_ip):
+    """Redirect HTTP traffic from clients to the portal host."""
+    try:
+        subprocess.run(
+            [
+                'sudo', 'iptables', '-t', 'nat', '-A', 'PREROUTING',
+                '-i', interface, '-p', 'tcp', '--dport', '80',
+                '-j', 'DNAT', '--to-destination', f'{portal_ip}:{PORT}'
+            ],
+            check=True,
+        )
+        print("✅ HTTP redirect rule added (clients -> captive portal).")
+    except subprocess.CalledProcessError as exc:
+        print(f"⚠️  Failed to add iptables redirect rule: {exc}")
+
 def start_captive_portal(interface, ssid):
     """Start captive portal on selected interface"""
     global CAPTIVE_PORTAL_SSID
@@ -552,6 +575,8 @@ def setup_wifi_ap(interface, ssid):
         return False
     
     try:
+        portal_ip = get_ap_ip_address()
+
         # Detach interface from NetworkManager if available (avoid stopping NM)
         if subprocess.run(['which', 'nmcli'], capture_output=True).returncode == 0:
             subprocess.run(['sudo', 'nmcli', 'dev', 'set', interface, 'managed', 'no'],
@@ -581,7 +606,8 @@ ignore_broadcast_ssid=0
         dnsmasq_conf = f"""interface={interface}
 dhcp-range=192.168.1.100,192.168.1.200,255.255.255.0,24h
 dhcp-option=3,192.168.1.1
-dhcp-option=6,8.8.8.8
+dhcp-option=6,{portal_ip}
+address=/#/{portal_ip}
 no-resolv
 log-queries
 log-dhcp
@@ -605,6 +631,8 @@ log-dhcp
         else:
             print("⚠️  Could not determine default route interface for NAT.")
             print("   Internet access for clients may not work.")
+
+        add_captive_portal_iptables_rules(interface, portal_ip)
         
         print("✅ Hotspot configured!")
         return True
