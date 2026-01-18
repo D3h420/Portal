@@ -5,6 +5,7 @@ import sys
 import time
 import subprocess
 import threading
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import logging
 
@@ -23,6 +24,9 @@ NETMASK = "255.255.255.0"
 DHCP_RANGE_START = "192.168.100.100"
 DHCP_RANGE_END = "192.168.100.200"
 LEASE_TIME = "12h"
+
+PORTAL_HTML = None
+PORTAL_HTML_PATH = os.path.join(os.path.dirname(__file__), "Router_update_v2.html")
 
 # HTML dla captive portal - miejsce na base64
 HTML_PAGE = """<!DOCTYPE html>
@@ -114,10 +118,44 @@ HTML_PAGE = """<!DOCTYPE html>
 </body>
 </html>"""
 
+def load_portal_html():
+    if os.path.isfile(PORTAL_HTML_PATH):
+        with open(PORTAL_HTML_PATH, "r", encoding="utf-8") as portal_file:
+            return portal_file.read()
+    return HTML_PAGE
+
+
 class CaptivePortalHandler(BaseHTTPRequestHandler):
+    PORTAL_PATHS = {
+        "/",
+        "/index.html",
+        "/captive.html",
+        "/hotspot-detect.html",
+        "/generate_204",
+        "/gen_204",
+        "/mobile/status.php",
+        "/ncsi.txt",
+        "/connecttest.txt",
+        "/redirect",
+        "/success.txt",
+        "/library/test/success.html",
+    }
+
+    def _redirect_to_portal(self):
+        self.send_response(302)
+        self.send_header("Location", f"http://{AP_IP}/")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.end_headers()
+
     def do_GET(self):
         """Handle GET requests - display login page"""
         print(f"[{datetime.now()}] GET request from {self.client_address[0]} to {self.path}")
+
+        if self.path in self.PORTAL_PATHS:
+            if self.path in {"/generate_204", "/gen_204", "/redirect", "/connecttest.txt", "/ncsi.txt"}:
+                self._redirect_to_portal()
+                return
 
         # Always display login page regardless of path (improves captive portal reach)
         html_content = PORTAL_HTML or load_portal_html()
@@ -219,6 +257,7 @@ log-dhcp
         # Konfiguracja iptables
         subprocess.run(['iptables', '-t', 'nat', '-F'])
         subprocess.run(['iptables', '-F'])
+        subprocess.run(['iptables', '-t', 'nat', '-A', 'PREROUTING', '-i', AP_INTERFACE, '-p', 'tcp', '--dport', '80', '-j', 'DNAT', '--to-destination', f'{AP_IP}:80'])
         subprocess.run(['iptables', '-t', 'nat', '-A', 'POSTROUTING', '-o', INTERNET_INTERFACE, '-j', 'MASQUERADE'])
         subprocess.run(['iptables', '-A', 'FORWARD', '-i', AP_INTERFACE, '-o', INTERNET_INTERFACE, '-j', 'ACCEPT'])
         subprocess.run(['iptables', '-A', 'FORWARD', '-i', INTERNET_INTERFACE, '-o', AP_INTERFACE, '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT'])
@@ -282,6 +321,26 @@ def main():
             logging.error(f"Required tool '{tool}' not found!")
             sys.exit(1)
     
+    # Wybór interfejsów
+    interfaces = []
+    ip_link = subprocess.run(['ip', '-o', 'link', 'show'], stdout=subprocess.PIPE, text=True, check=False)
+    for line in ip_link.stdout.splitlines():
+        if ": " in line:
+            name = line.split(": ", 1)[1].split(":", 1)[0]
+            if name and name != "lo":
+                interfaces.append(name)
+
+    if interfaces:
+        logging.info("Available interfaces: %s", ", ".join(interfaces))
+
+    ap_choice = input(f"AP interface [{AP_INTERFACE}]: ").strip()
+    if ap_choice:
+        globals()["AP_INTERFACE"] = ap_choice
+
+    internet_choice = input(f"Internet interface [{INTERNET_INTERFACE}]: ").strip()
+    if internet_choice:
+        globals()["INTERNET_INTERFACE"] = internet_choice
+
     # Rejestruj cleanup przy wyjściu
     import atexit
     atexit.register(cleanup)
