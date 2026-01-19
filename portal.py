@@ -150,12 +150,12 @@ def select_network_ssid(interface):
         networks = scan_wireless_networks(interface)
         if not networks:
             logging.warning("No networks found during scan.")
-            retry = input("Rescan? (Y/N): ").strip().lower()
+            retry = input(f"{style('Rescan', STYLE_BOLD)}? (Y/N): ").strip().lower()
             if retry == "y":
                 continue
             sys.exit(1)
 
-        logging.info("Available networks:")
+        logging.info(style("Available networks:", STYLE_BOLD))
         for index, network in enumerate(networks, start=1):
             signal = (
                 f"{network['signal']:.1f} dBm"
@@ -165,7 +165,9 @@ def select_network_ssid(interface):
             label = f"{index}) {network['ssid']} -"
             logging.info("  %s %s", color_text(label, COLOR_HIGHLIGHT), signal)
 
-        choice = input("Select network (number, or R to rescan): ").strip().lower()
+        choice = input(
+            f"{style('Select network', STYLE_BOLD)} (number, or R to rescan): "
+        ).strip().lower()
         if choice == "r":
             continue
         if choice.isdigit():
@@ -180,14 +182,14 @@ def select_interface(interfaces):
         logging.error("No network interfaces found.")
         sys.exit(1)
 
-    logging.info("Available interfaces:")
+    logging.info(style("Available interfaces:", STYLE_BOLD))
     for index, name in enumerate(interfaces, start=1):
         chipset = get_interface_chipset(name)
         label = f"{index}) {name} -"
         logging.info("  %s %s", color_text(label, COLOR_HIGHLIGHT), chipset)
 
     while True:
-        choice = input("Select AP interface (number or name): ").strip()
+        choice = input(f"{style('Select AP interface', STYLE_BOLD)} (number or name): ").strip()
         if not choice:
             logging.warning("Please select an interface.")
             continue
@@ -408,12 +410,15 @@ def run_portal_session():
     globals()["AP_INTERFACE"] = select_interface(interfaces)
 
     subprocess.run(['ip', 'link', 'set', AP_INTERFACE, 'up'], stderr=subprocess.DEVNULL)
-    input(f"Press Enter to scan networks on {AP_INTERFACE}...")
+    input(f"{style('Press Enter', STYLE_BOLD)} to scan networks on {AP_INTERFACE}...")
 
     # Nazwa sieci po skanowaniu
     globals()["AP_SSID"] = select_network_ssid(AP_INTERFACE)
 
-    input(f"Press Enter to start captive portal '{style(AP_SSID, COLOR_SUCCESS, STYLE_BOLD)}'...")
+    input(
+        f"{style('Press Enter', STYLE_BOLD)} to start captive portal "
+        f"'{style(AP_SSID, COLOR_SUCCESS, STYLE_BOLD)}'..."
+    )
 
     capture_filename = sanitize_filename(AP_SSID)
     globals()["CAPTURE_FILE_PATH"] = os.path.join(os.path.dirname(__file__), capture_filename)
@@ -457,7 +462,9 @@ def run_portal_session():
 
                 logging.info(style("harvest complete!", COLOR_SUCCESS, STYLE_BOLD))
                 while True:
-                    exit_choice = input("Exit script (E) or restart (R): ").strip().lower()
+                    exit_choice = input(
+                        f"{style('Exit script', STYLE_BOLD)} (E) or {style('restart', STYLE_BOLD)} (R): "
+                    ).strip().lower()
                     if exit_choice in {"e", "exit"}:
                         break
                     if exit_choice in {"r", "restart"}:
