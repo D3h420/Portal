@@ -3,14 +3,13 @@
 # SwissKnife 🧰
 
 Wireless "swiss knife" that bundles three workflows into one menu-driven tool:
-Deauth, Captive Portal, and Evil Twin. The main entry point is `swiss_knife.py`,
-which launches each module and returns you to the menu when it exits. Control
-the chaos with [Lab5](https://github.com/C5Lab) (responsibly).
+Deauth, Captive Portal, and Evil Twin. The main entry point is `swiss_knife.py`.
+Control the chaos with [Lab5](https://github.com/C5Lab) (responsibly).
 
 ## Quick start ⚡
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/D3h420/SwissKnife
 cd SwissKnife
 sudo chmod +x swiss_knife.py
 python3 swiss_knife.py
