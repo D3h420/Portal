@@ -170,14 +170,15 @@ def scan_wireless_networks(interface, duration_seconds=15, show_progress=False):
     )
 
 
-def select_network_ssid(interface, duration_seconds):
-    def prompt_manual_ssid():
-        while True:
-            manual = input(f"{style('Enter SSID', STYLE_BOLD)}: ").strip()
-            if manual:
-                return manual
-            logging.warning("SSID cannot be empty.")
+def prompt_manual_ssid():
+    while True:
+        manual = input(f"{style('Enter SSID', STYLE_BOLD)}: ").strip()
+        if manual:
+            return manual
+        logging.warning("SSID cannot be empty.")
 
+
+def select_network_ssid(interface, duration_seconds):
     while True:
         networks = scan_wireless_networks(interface, duration_seconds, show_progress=True)
         if not networks:
@@ -193,6 +194,7 @@ def select_network_ssid(interface, duration_seconds):
                 return prompt_manual_ssid()
             sys.exit(1)
 
+        logging.info("")
         logging.info(style("Available networks:", STYLE_BOLD))
         for index, network in enumerate(networks, start=1):
             signal = (
@@ -222,6 +224,7 @@ def select_interface(interfaces):
         logging.error("No network interfaces found.")
         sys.exit(1)
 
+    logging.info("")
     logging.info(style("Available interfaces:", STYLE_BOLD))
     for index, name in enumerate(interfaces, start=1):
         chipset = get_interface_chipset(name)
@@ -450,30 +453,44 @@ def run_portal_session():
     globals()["AP_INTERFACE"] = select_interface(interfaces)
 
     subprocess.run(['ip', 'link', 'set', AP_INTERFACE, 'up'], stderr=subprocess.DEVNULL)
-    scan_prompt = (
-        f"{style('Scan duration', STYLE_BOLD)} in seconds "
-        f"({style('Enter', STYLE_BOLD)} for {style('15', COLOR_SUCCESS, STYLE_BOLD)}): "
-    )
-    scan_input = input(scan_prompt).strip()
-    try:
-        scan_seconds = int(scan_input) if scan_input else 15
-    except ValueError:
-        logging.warning("Invalid duration. Using 15 seconds.")
-        scan_seconds = 15
-    if scan_seconds < 1:
-        logging.warning("Scan duration too short. Using 1 second.")
-        scan_seconds = 1
+    logging.info("")
+    while True:
+        method = input(
+            f"{style('SSID source', STYLE_BOLD)} - "
+            f"{style('Scan', STYLE_BOLD)} (S) or {style('Manual', STYLE_BOLD)} (M): "
+        ).strip().lower()
+        if method in {"s", "scan", ""}:
+            scan_prompt = (
+                f"{style('Scan duration', STYLE_BOLD)} in seconds "
+                f"({style('Enter', STYLE_BOLD)} for {style('15', COLOR_SUCCESS, STYLE_BOLD)}): "
+            )
+            scan_input = input(scan_prompt).strip()
+            try:
+                scan_seconds = int(scan_input) if scan_input else 15
+            except ValueError:
+                logging.warning("Invalid duration. Using 15 seconds.")
+                scan_seconds = 15
+            if scan_seconds < 1:
+                logging.warning("Scan duration too short. Using 1 second.")
+                scan_seconds = 1
 
-    input(f"{style('Press Enter', STYLE_BOLD)} to scan networks on {AP_INTERFACE}...")
+            input(f"{style('Press Enter', STYLE_BOLD)} to scan networks on {AP_INTERFACE}...")
 
-    # Select SSID after scan (or enter manually).
-    globals()["AP_SSID"] = select_network_ssid(AP_INTERFACE, scan_seconds)
+            # Select SSID after scan (or enter manually).
+            globals()["AP_SSID"] = select_network_ssid(AP_INTERFACE, scan_seconds)
+            break
+        if method in {"m", "manual"}:
+            globals()["AP_SSID"] = prompt_manual_ssid()
+            break
+        logging.warning("Please enter S or M.")
 
+    logging.info("")
     input(
         f"{style('Press Enter', STYLE_BOLD)} to start captive portal "
         f"'{style(AP_SSID, COLOR_SUCCESS, STYLE_BOLD)}'..."
     )
 
+    logging.info("")
     os.makedirs(LOG_DIR, exist_ok=True)
     capture_filename = sanitize_filename(AP_SSID)
     globals()["CAPTURE_FILE_PATH"] = os.path.join(LOG_DIR, capture_filename)
@@ -494,6 +511,7 @@ def run_portal_session():
         # Start Captive Portal.
         http_server = start_captive_portal()
         
+        logging.info("")
         logging.info("=" * 50)
         logging.info(f"Captive Portal is {style('running', COLOR_RUNNING, STYLE_BOLD)}!")
         logging.info(f"SSID: {style(AP_SSID, COLOR_SUCCESS, STYLE_BOLD)}")
@@ -515,17 +533,18 @@ def run_portal_session():
                 with SUBMISSION_LOCK:
                     SUBMISSION_EVENT.clear()
 
+                logging.info("")
                 logging.info(style("harvest complete!", COLOR_SUCCESS, STYLE_BOLD))
                 while True:
                     exit_choice = input(
-                        f"{style('Exit script', STYLE_BOLD)} (E) or {style('restart', STYLE_BOLD)} (R): "
+                        f"{style('Back to main menu', STYLE_BOLD)} (B) or {style('restart', STYLE_BOLD)} (R): "
                     ).strip().lower()
-                    if exit_choice in {"e", "exit"}:
+                    if exit_choice in {"b", "back"}:
                         break
                     if exit_choice in {"r", "restart"}:
                         restart_requested = True
                         break
-                    logging.warning("Please enter E or R.")
+                    logging.warning("Please enter B or R.")
 
                 break
 
@@ -552,6 +571,7 @@ def main():
     """Main entry point."""
     logging.info(color_text("Portal Wizard", COLOR_HEADER))
     logging.info("Starting Captive Portal System")
+    logging.info("")
     
     # Verify privileges.
     if os.geteuid() != 0:

@@ -262,6 +262,7 @@ def select_network(attack_interface: str, duration_seconds: int) -> Dict[str, Op
                 continue
             sys.exit(1)
 
+        logging.info("")
         logging.info(style("Available networks:", STYLE_BOLD))
         for index, net in enumerate(networks, start=1):
             signal = f"{net['signal']:.1f} dBm" if net["signal"] is not None else "signal unknown"
@@ -286,6 +287,7 @@ def select_interface(interfaces: List[str]) -> str:
         logging.error("No network interfaces found.")
         sys.exit(1)
 
+    logging.info("")
     logging.info(style("Available interfaces:", STYLE_BOLD))
     for index, name in enumerate(interfaces, start=1):
         chipset = get_interface_chipset(name)
@@ -402,10 +404,12 @@ def run_deauth_session() -> bool:
     interfaces = list_network_interfaces()
     SELECTED_INTERFACE = select_interface(interfaces)
 
+    logging.info("")
     input(f"{style('Press Enter', STYLE_BOLD)} to switch {SELECTED_INTERFACE} to monitor mode...")
     if not enable_monitor_mode(SELECTED_INTERFACE, None):
         return False
 
+    logging.info("")
     scan_prompt = (
         f"{style('Scan duration', STYLE_BOLD)} in seconds "
         f"({style('Enter', STYLE_BOLD)} for {style('15', COLOR_SUCCESS, STYLE_BOLD)}): "
@@ -420,8 +424,10 @@ def run_deauth_session() -> bool:
         logging.warning("Scan duration too short. Using 1 second.")
         scan_seconds = 1
 
+    logging.info("")
     input(f"{style('Press Enter', STYLE_BOLD)} to scan networks on {SELECTED_INTERFACE}...")
     target_network = select_network(SELECTED_INTERFACE, scan_seconds)
+    logging.info("")
     logging.info(
         "Target selected: %s (%s)",
         style(target_network["ssid"], COLOR_SUCCESS, STYLE_BOLD),
@@ -433,6 +439,7 @@ def run_deauth_session() -> bool:
         if not enable_monitor_mode(SELECTED_INTERFACE, target_network.get("channel")):
             return False
 
+    logging.info("")
     input(
         f"{style('Press Enter', STYLE_BOLD)} to start Deauth attack on "
         f"{style(target_network['ssid'], COLOR_SUCCESS, STYLE_BOLD)}..."
@@ -441,6 +448,7 @@ def run_deauth_session() -> bool:
     if not start_deauth_attack(SELECTED_INTERFACE, target_network):
         return False
 
+    logging.info("")
     logging.info("=" * 50)
     logging.info(f"Deauth attack is {style('running', COLOR_RUNNING, STYLE_BOLD)}!")
     logging.info(f"Target: {style(target_network['ssid'], COLOR_SUCCESS, STYLE_BOLD)} ({target_network['bssid']})")
@@ -472,20 +480,22 @@ def run_deauth_session() -> bool:
         stop_attack()
         restore_managed_mode(SELECTED_INTERFACE)
 
+    logging.info("")
     while True:
         choice = input(
-            f"{style('Exit script', STYLE_BOLD)} (E) or {style('restart', STYLE_BOLD)} (R): "
+            f"{style('Back to main menu', STYLE_BOLD)} (B) or {style('restart', STYLE_BOLD)} (R): "
         ).strip().lower()
-        if choice in {"e", "exit"}:
+        if choice in {"b", "back"}:
             return False
         if choice in {"r", "restart"}:
             return True
-        logging.warning("Please enter E or R.")
+        logging.warning("Please enter B or R.")
 
 
 def main():
     logging.info(color_text("Deauth Wizard", COLOR_HEADER))
     logging.info("Starting Deauth Attack System")
+    logging.info("")
 
     if os.geteuid() != 0:
         logging.error("This script must be run as root!")

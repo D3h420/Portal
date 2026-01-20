@@ -303,6 +303,7 @@ def select_network(attack_interface: str, duration_seconds: int) -> Dict[str, Op
                 continue
             sys.exit(1)
 
+        logging.info("")
         logging.info(style("Available networks:", STYLE_BOLD))
         for index, net in enumerate(networks, start=1):
             signal = f"{net['signal']:.1f} dBm" if net["signal"] is not None else "signal unknown"
@@ -327,6 +328,7 @@ def select_interface(interfaces: List[str], prompt_label: str) -> str:
         logging.error("No network interfaces found.")
         sys.exit(1)
 
+    logging.info("")
     logging.info(style("Available interfaces:", STYLE_BOLD))
     for index, name in enumerate(interfaces, start=1):
         chipset = get_interface_chipset(name)
@@ -748,13 +750,16 @@ def run_twins_session() -> bool:
     DEAUTH_ACTIVE = True
     DEAUTH_FAILURES = 0
 
+    restart_requested = False
     interfaces = list_network_interfaces()
     ATTACK_INTERFACE = select_interface(interfaces, "Select attack interface")
 
+    logging.info("")
     input(f"{style('Press Enter', STYLE_BOLD)} to switch {ATTACK_INTERFACE} to monitor mode...")
     if not enable_monitor_mode(ATTACK_INTERFACE, None):
         return False
 
+    logging.info("")
     scan_prompt = (
         f"{style('Scan duration', STYLE_BOLD)} in seconds "
         f"({style('Enter', STYLE_BOLD)} for {style('15', COLOR_SUCCESS, STYLE_BOLD)}): "
@@ -769,8 +774,10 @@ def run_twins_session() -> bool:
         logging.warning("Scan duration too short. Using 1 second.")
         scan_seconds = 1
 
+    logging.info("")
     input(f"{style('Press Enter', STYLE_BOLD)} to scan networks on {ATTACK_INTERFACE}...")
     target_network = select_network(ATTACK_INTERFACE, scan_seconds)
+    logging.info("")
     logging.info(
         "Target selected: %s (%s)",
         style(target_network["ssid"], COLOR_SUCCESS, STYLE_BOLD),
@@ -783,9 +790,11 @@ def run_twins_session() -> bool:
 
     AP_SSID = target_network["ssid"] or "<hidden>"
     os.makedirs(LOG_DIR, exist_ok=True)
+    logging.info("")
     CAPTURE_FILE_PATH = os.path.join(LOG_DIR, sanitize_filename(AP_SSID))
     logging.info("Capturing portal submissions in: %s", CAPTURE_FILE_PATH)
 
+    logging.info("")
     if not disclaimer_confirmed(AP_SSID, target_network["bssid"] or "unknown"):
         logging.info(color_text("Aborted by user.", COLOR_STOP))
         return False
@@ -795,6 +804,7 @@ def run_twins_session() -> bool:
         if not enable_monitor_mode(ATTACK_INTERFACE, target_network.get("channel")):
             return False
 
+    logging.info("")
     input(
         f"{style('Press Enter', STYLE_BOLD)} to start Evil Twin for "
         f"{style(AP_SSID, COLOR_SUCCESS, STYLE_BOLD)}..."
@@ -809,6 +819,7 @@ def run_twins_session() -> bool:
     time.sleep(5)
     HTTP_SERVER = start_captive_portal()
 
+    logging.info("")
     logging.info("=" * 50)
     logging.info(f"Evil Twin is {style('running', COLOR_RUNNING, STYLE_BOLD)}!")
     logging.info(f"Target: {style(AP_SSID, COLOR_SUCCESS, STYLE_BOLD)} ({target_network['bssid']})")
@@ -852,8 +863,20 @@ def run_twins_session() -> bool:
                 DEAUTH_ACTIVE = False
                 stop_attack()
                 shutdown_http_server()
+                logging.info("")
                 logging.info(style("harvest complete!", COLOR_SUCCESS, STYLE_BOLD))
-                return False
+                while True:
+                    choice = input(
+                        f"{style('Back to main menu', STYLE_BOLD)} (B) or {style('restart', STYLE_BOLD)} (R): "
+                    ).strip().lower()
+                    if choice in {"b", "back"}:
+                        restart_requested = False
+                        break
+                    if choice in {"r", "restart"}:
+                        restart_requested = True
+                        break
+                    logging.warning("Please enter B or R.")
+                return restart_requested
 
             for i, proc in enumerate(processes):
                 if proc and proc.poll() is not None:
@@ -870,6 +893,7 @@ def run_twins_session() -> bool:
 def main():
     logging.info(color_text("Evil Twin Wizard", COLOR_HEADER))
     logging.info("Starting Evil Twin System")
+    logging.info("")
 
     if os.geteuid() != 0:
         logging.error("This script must be run as root!")
