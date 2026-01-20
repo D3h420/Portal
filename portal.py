@@ -39,8 +39,11 @@ DHCP_RANGE_START = "192.168.100.100"
 DHCP_RANGE_END = "192.168.100.200"
 LEASE_TIME = "12h"
 
+BASE_DIR = os.path.dirname(__file__)
+LOG_DIR = os.path.join(BASE_DIR, "log")
+HTML_DIR = os.path.join(BASE_DIR, "html")
 PORTAL_HTML = None
-PORTAL_HTML_PATH = os.path.join(os.path.dirname(__file__), "Router_update_v2.html")
+PORTAL_HTML_PATH = os.path.join(HTML_DIR, "portal.html")
 CAPTURE_FILE_PATH = None
 SUBMISSION_EVENT = threading.Event()
 SUBMISSION_LOCK = threading.Lock()
@@ -456,8 +459,9 @@ def run_portal_session():
         f"'{style(AP_SSID, COLOR_SUCCESS, STYLE_BOLD)}'..."
     )
 
+    os.makedirs(LOG_DIR, exist_ok=True)
     capture_filename = sanitize_filename(AP_SSID)
-    globals()["CAPTURE_FILE_PATH"] = os.path.join(os.path.dirname(__file__), capture_filename)
+    globals()["CAPTURE_FILE_PATH"] = os.path.join(LOG_DIR, capture_filename)
     logging.info("Capturing portal submissions in: %s", CAPTURE_FILE_PATH)
     
     http_server = None

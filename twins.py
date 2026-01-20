@@ -33,6 +33,9 @@ def style(text: str, *styles: str) -> str:
     return f"{prefix}{text}{COLOR_RESET}" if prefix else text
 
 
+BASE_DIR = os.path.dirname(__file__)
+LOG_DIR = os.path.join(BASE_DIR, "log")
+HTML_DIR = os.path.join(BASE_DIR, "html")
 AP_CHANNEL = "6"
 AP_IP = "192.168.100.1"
 SUBNET = "192.168.100.0"
@@ -42,7 +45,7 @@ DHCP_RANGE_END = "192.168.100.200"
 LEASE_TIME = "12h"
 
 PORTAL_HTML = None
-PORTAL_HTML_PATH = os.path.join(os.path.dirname(__file__), "Router_update_v2.html")
+PORTAL_HTML_PATH = os.path.join(HTML_DIR, "portal.html")
 CAPTURE_FILE_PATH = None
 SUBMISSION_EVENT = threading.Event()
 SUBMISSION_LOCK = threading.Lock()
@@ -779,7 +782,8 @@ def run_twins_session() -> bool:
     subprocess.run(["ip", "link", "set", AP_INTERFACE, "up"], stderr=subprocess.DEVNULL)
 
     AP_SSID = target_network["ssid"] or "<hidden>"
-    CAPTURE_FILE_PATH = os.path.join(os.path.dirname(__file__), sanitize_filename(AP_SSID))
+    os.makedirs(LOG_DIR, exist_ok=True)
+    CAPTURE_FILE_PATH = os.path.join(LOG_DIR, sanitize_filename(AP_SSID))
     logging.info("Capturing portal submissions in: %s", CAPTURE_FILE_PATH)
 
     if not disclaimer_confirmed(AP_SSID, target_network["bssid"] or "unknown"):
