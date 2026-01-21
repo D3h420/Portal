@@ -39,11 +39,22 @@ ASCII_HEADER = r"""
 wireless swiss knife
 """
 
-SCRIPT_MAP: Dict[str, Dict[str, str]] = {
-    "1": {"name": "Deauth", "file": "deauth.py"},
-    "2": {"name": "Portal", "file": "portal.py"},
-    "3": {"name": "Evil Twin", "file": "twins.py"},
-    "4": {"name": "Exit", "file": ""},
+MAIN_MENU: Dict[str, Dict[str, str]] = {
+    "1": {"name": "Recon", "action": "recon"},
+    "2": {"name": "Attacks", "action": "attacks"},
+    "3": {"name": "Exit", "action": "exit"},
+}
+
+ATTACKS_MENU: Dict[str, Dict[str, str]] = {
+    "1": {"name": "Deauth", "file": os.path.join("modules", "deauth.py")},
+    "2": {"name": "Portal", "file": os.path.join("modules", "portal.py")},
+    "3": {"name": "Evil Twin", "file": os.path.join("modules", "twins.py")},
+    "4": {"name": "Back", "file": ""},
+}
+
+RECON_MENU: Dict[str, Dict[str, str]] = {
+    "1": {"name": "Wireless Recon", "file": os.path.join("modules", "recon.py")},
+    "2": {"name": "Back", "file": ""},
 }
 
 
@@ -55,11 +66,11 @@ def script_path(filename: str) -> str:
     return os.path.join(base_dir(), filename)
 
 
-def print_header() -> None:
+def print_header(title: str, menu: Dict[str, Dict[str, str]]) -> None:
     print(color_text(ASCII_HEADER, COLOR_HEADER))
-    print(style("Choose an attack to run:", STYLE_BOLD))
+    print(style(title, STYLE_BOLD))
     print()
-    for key, meta in SCRIPT_MAP.items():
+    for key, meta in menu.items():
         label = f"[{key}] {meta['name']}"
         print(f"  {color_text(label, COLOR_HIGHLIGHT)}")
     print()
@@ -87,24 +98,59 @@ def run_child(script_file: str) -> None:
         pass
 
 
+def recon_menu() -> None:
+    while True:
+        print_header("Recon:", RECON_MENU)
+        choice = input(style("Your choice (1-2): ", STYLE_BOLD)).strip()
+
+        if choice not in RECON_MENU:
+            print(color_text("Invalid choice, try again.\n", COLOR_HIGHLIGHT))
+            continue
+
+        if choice == "2":
+            break
+        run_child(RECON_MENU[choice]["file"])
+
+
+def attacks_menu() -> None:
+    while True:
+        print_header("Attacks:", ATTACKS_MENU)
+        choice = input(style("Your choice (1-4): ", STYLE_BOLD)).strip()
+
+        if choice not in ATTACKS_MENU:
+            print(color_text("Invalid choice, try again.\n", COLOR_HIGHLIGHT))
+            continue
+
+        if choice == "4":
+            break
+
+        run_child(ATTACKS_MENU[choice]["file"])
+
+
 def main() -> None:
     if os.geteuid() != 0:
         print(color_text("This launcher must be run as root.", COLOR_HIGHLIGHT))
         sys.exit(1)
 
     while True:
-        print_header()
-        choice = input(style("Your choice (1-4): ", STYLE_BOLD)).strip()
+        print_header("Main menu:", MAIN_MENU)
+        choice = input(style("Your choice (1-3): ", STYLE_BOLD)).strip()
 
-        if choice not in SCRIPT_MAP:
+        if choice not in MAIN_MENU:
             print(color_text("Invalid choice, try again.\n", COLOR_HIGHLIGHT))
             continue
 
-        if choice == "4":
+        if choice == "3":
             print(style("Exiting. See you!", COLOR_SUCCESS, STYLE_BOLD))
             break
 
-        run_child(SCRIPT_MAP[choice]["file"])
+        if choice == "1":
+            recon_menu()
+            continue
+
+        if choice == "2":
+            attacks_menu()
+            continue
 
 
 if __name__ == "__main__":

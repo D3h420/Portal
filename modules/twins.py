@@ -33,9 +33,10 @@ def style(text: str, *styles: str) -> str:
     return f"{prefix}{text}{COLOR_RESET}" if prefix else text
 
 
-BASE_DIR = os.path.dirname(__file__)
-LOG_DIR = os.path.join(BASE_DIR, "log")
-HTML_DIR = os.path.join(BASE_DIR, "html")
+MODULE_DIR = os.path.dirname(__file__)
+PROJECT_ROOT = os.path.dirname(MODULE_DIR)
+LOG_DIR = os.path.join(PROJECT_ROOT, "log")
+HTML_DIR = os.path.join(PROJECT_ROOT, "html")
 AP_CHANNEL = "6"
 AP_IP = "192.168.100.1"
 SUBNET = "192.168.100.0"

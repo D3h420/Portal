@@ -3,7 +3,7 @@
 # SwissKnife 🧰
 
 Wireless "swiss knife" that bundles three workflows into one menu-driven tool:
-Deauth, Captive Portal, and Evil Twin. The main entry point is `swiss_knife.py`.
+Recon, Deauth, Captive Portal, and Evil Twin. The main entry point is `swiss_knife.py`.
 Control the chaos with [Lab5](https://github.com/C5Lab) (responsibly).
 
 ## Quick start ⚡
@@ -31,11 +31,14 @@ under `html/` is safe to modify for UI tweaks or branding.
 ## Project layout 🗂️
 
 - `swiss_knife.py` - main launcher and menu
-- `deauth.py` - deauth attack workflow
-- `portal.py` - captive portal workflow
-- `twins.py` - evil twin workflow
+- `modules/` - secondary modules (recon + attacks)
+- `modules/recon.py` - passive recon (iw/scapy scans)
+- `modules/deauth.py` - deauth attack workflow
+- `modules/portal.py` - captive portal workflow
+- `modules/twins.py` - evil twin workflow
 - `html/` - portal UI templates
 - `log/` - captured submissions (created at runtime)
+- `modules/oui.txt` - optional vendor database for recon (place your own)
 
 ## Requirements 🧩
 
@@ -52,6 +55,14 @@ Tools used by the modules:
 - `hostapd`
 - `dnsmasq`
 - `iptables`
+
+Optional for recon:
+- `scapy` (enables monitor-mode sniffing)
+
+## Recon vendor lookup (optional)
+
+If you want vendor names in recon results, add an OUI file at `modules/oui.txt`
+or set `SWISSKNIFE_VENDOR_DB` to a custom path.
 
 ## Legal note ⚠️
 

@@ -39,9 +39,10 @@ DHCP_RANGE_START = "192.168.100.100"
 DHCP_RANGE_END = "192.168.100.200"
 LEASE_TIME = "12h"
 
-BASE_DIR = os.path.dirname(__file__)
-LOG_DIR = os.path.join(BASE_DIR, "log")
-HTML_DIR = os.path.join(BASE_DIR, "html")
+MODULE_DIR = os.path.dirname(__file__)
+PROJECT_ROOT = os.path.dirname(MODULE_DIR)
+LOG_DIR = os.path.join(PROJECT_ROOT, "log")
+HTML_DIR = os.path.join(PROJECT_ROOT, "html")
 PORTAL_HTML = None
 PORTAL_HTML_PATH = os.path.join(HTML_DIR, "portal.html")
 CAPTURE_FILE_PATH = None
