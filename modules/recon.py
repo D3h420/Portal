@@ -54,11 +54,11 @@ DEFAULT_MONITOR_CHANNELS = (
         165,
     ]
 )
-DEFAULT_HOP_INTERVAL = 2.0
-DEFAULT_LIVE_UPDATE_INTERVAL = 1.0
+DEFAULT_HOP_INTERVAL = 0.8
+DEFAULT_LIVE_UPDATE_INTERVAL = 0.5
 
 try:
-    from scapy.all import Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, sniff  # type: ignore
+    from scapy.all import Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeReq, Dot11ProbeResp, sniff  # type: ignore
     SCAPY_AVAILABLE = True
 except Exception:
     SCAPY_AVAILABLE = False
@@ -275,6 +275,15 @@ def lookup_vendor(mac_address: Optional[str], vendors: Dict[str, str]) -> Option
     if vendor:
         return vendor
     return None
+
+
+def shorten_vendor(vendor: Optional[str], max_len: int = 22) -> Optional[str]:
+    if not vendor:
+        return None
+    cleaned = " ".join(vendor.split())
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 3].rstrip() + "..."
 
 
 def finalize_encryption(privacy: bool, wpa: bool, wpa2: bool, wps: bool) -> str:
@@ -738,13 +747,11 @@ def format_scapy_results_lines(aps: Dict[str, AccessPoint], vendors: Dict[str, s
     lines: List[str] = [style("Observed access points:", STYLE_BOLD)]
     for index, ap in enumerate(sorted_aps, start=1):
         channel = f"ch {ap.channel}" if ap.channel else "ch ?"
-        frequency = f"{ap.frequency} MHz" if ap.frequency else "freq ?"
-        signal = f"{ap.signal}%" if ap.signal is not None else "signal ?"
         rssi = f"{ap.rssi} dBm" if ap.rssi is not None else "rssi ?"
         clients = f"clients {len(ap.clients)}"
-        vendor = lookup_vendor(ap.bssid, vendors)
+        vendor = shorten_vendor(lookup_vendor(ap.bssid, vendors))
         label = f"{index}) {ap.ssid} ({ap.bssid}) -"
-        details = f"{channel} | {frequency} | {ap.encryption} | {rssi} | {clients} | {signal}"
+        details = f"{channel} | {ap.encryption} | {rssi} | {clients}"
         if vendor:
             details += f" | {vendor}"
         lines.append(f"  {color_text(label, COLOR_HIGHLIGHT)} {details}")
@@ -765,7 +772,7 @@ def display_scapy_live_update(
     remaining: int,
     interface: str,
 ) -> None:
-    header = style(f"Monitor scan on {interface}", STYLE_BOLD)
+    header = style(f"Scaner on {interface}", STYLE_BOLD)
     progress = (
         f"{style('Scanning', STYLE_BOLD)}... "
         f"{style(str(remaining), COLOR_SUCCESS, STYLE_BOLD)}s remaining"
@@ -806,15 +813,179 @@ def prompt_float(prompt: str, default: float, minimum: float = 0.2) -> float:
     return value
 
 
+def format_client_list(clients: Set[str], max_items: int = 3) -> str:
+    if not clients:
+        return ""
+    sorted_clients = sorted(clients)
+    if len(sorted_clients) <= max_items:
+        return ", ".join(sorted_clients)
+    remaining = len(sorted_clients) - max_items
+    shown = ", ".join(sorted_clients[:max_items])
+    return f"{shown} +{remaining}"
+
+
+def display_sniffer_live(packet_count: int, remaining: int, interface: str) -> None:
+    header = style(f"Sniffer on {interface}", STYLE_BOLD)
+    progress = (
+        f"{style('Listening', STYLE_BOLD)}... "
+        f"{style(str(remaining), COLOR_SUCCESS, STYLE_BOLD)}s remaining"
+    )
+    count_line = f"{style('Packets', STYLE_BOLD)}: {style(str(packet_count), COLOR_SUCCESS, STYLE_BOLD)}"
+    output = "\n".join([header, progress, count_line])
+    if COLOR_ENABLED:
+        sys.stdout.write("\033[2J\033[H" + output + "\n")
+    else:
+        sys.stdout.write(output + "\n")
+    sys.stdout.flush()
+
+
+def format_sniffer_networks_lines(aps: Dict[str, AccessPoint], vendors: Dict[str, str]) -> List[str]:
+    if not aps:
+        return [color_text("No networks found.", COLOR_WARNING)]
+
+    sorted_aps = sorted(
+        aps.values(),
+        key=lambda ap: (len(ap.clients), ap.signal if ap.signal is not None else -1),
+        reverse=True,
+    )
+
+    lines: List[str] = [style("Observed networks:", STYLE_BOLD)]
+    for index, ap in enumerate(sorted_aps, start=1):
+        channel = f"ch {ap.channel}" if ap.channel else "ch ?"
+        rssi = f"{ap.rssi} dBm" if ap.rssi is not None else "rssi ?"
+        client_count = len(ap.clients)
+        client_list = format_client_list(ap.clients)
+        client_label = f"clients {client_count}"
+        if client_list:
+            client_label += f" ({client_list})"
+        vendor = shorten_vendor(lookup_vendor(ap.bssid, vendors))
+        label = f"{index}) {ap.ssid} ({ap.bssid}) -"
+        details = f"{channel} | {ap.encryption} | {rssi} | {client_label}"
+        if vendor:
+            details += f" | {vendor}"
+        lines.append(f"  {color_text(label, COLOR_HIGHLIGHT)} {details}")
+    return lines
+
+
+def format_probe_lines(probe_counts: Dict[str, int]) -> List[str]:
+    if not probe_counts:
+        return [color_text("No probe requests observed.", COLOR_WARNING)]
+
+    lines: List[str] = [style("Observed probes:", STYLE_BOLD)]
+    for ssid, count in sorted(probe_counts.items(), key=lambda item: item[1], reverse=True)[:10]:
+        lines.append(f"  {color_text(ssid, COLOR_HIGHLIGHT)} - {count}")
+    return lines
+
+
+def run_sniffer(
+    interface: str,
+    duration_seconds: int,
+    channels: Optional[List[int]] = None,
+    hop_interval: float = DEFAULT_HOP_INTERVAL,
+    update_interval: float = 1.0,
+) -> Tuple[Dict[str, AccessPoint], Dict[str, int], int]:
+    aps: Dict[str, AccessPoint] = {}
+    probe_counts: Dict[str, int] = {}
+    packet_count = 0
+    aps_lock = threading.Lock()
+
+    def handle_packet(packet) -> None:
+        nonlocal packet_count
+        with aps_lock:
+            packet_count += 1
+
+        if not packet.haslayer(Dot11):
+            return
+
+        if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
+            bssid = packet[Dot11].addr3
+            if not bssid:
+                return
+            ssid, _hidden = extract_ssid(packet)
+            channel = extract_channel(packet)
+            frequency = channel_to_freq_mhz(channel)
+            encryption = extract_encryption(packet)
+            rssi = get_rssi(packet)
+            signal = rssi_to_quality(rssi)
+
+            with aps_lock:
+                ap = aps.get(bssid)
+                if ap is None:
+                    aps[bssid] = AccessPoint(
+                        ssid=ssid,
+                        bssid=bssid,
+                        channel=channel,
+                        frequency=frequency,
+                        encryption=encryption,
+                        rssi=rssi,
+                        signal=signal,
+                    )
+                else:
+                    if ap.ssid == "<hidden>" and ssid != "<hidden>":
+                        ap.ssid = ssid
+                    if channel and not ap.channel:
+                        ap.channel = channel
+                    if frequency and not ap.frequency:
+                        ap.frequency = frequency
+                    if encryption and encryption != ap.encryption:
+                        ap.encryption = encryption
+                    ap.update_signal(rssi)
+
+        if packet.haslayer(Dot11ProbeReq):
+            ssid, hidden = extract_ssid(packet)
+            if not hidden and ssid not in ("<hidden>", "<non-printable>"):
+                with aps_lock:
+                    probe_counts[ssid] = probe_counts.get(ssid, 0) + 1
+
+        sender = packet.addr2
+        receiver = packet.addr1
+        with aps_lock:
+            if sender in aps and is_unicast(receiver):
+                aps[sender].clients.add(receiver)
+            if receiver in aps and is_unicast(sender):
+                aps[receiver].clients.add(sender)
+
+    sniff_thread = threading.Thread(
+        target=sniff,
+        kwargs={"iface": interface, "prn": handle_packet, "store": False, "timeout": duration_seconds},
+        daemon=True,
+    )
+    stop_event = threading.Event()
+    hopper_thread: Optional[threading.Thread] = None
+    if channels:
+        hopper_thread = threading.Thread(
+            target=channel_hopper, args=(interface, channels, hop_interval, stop_event), daemon=True
+        )
+        hopper_thread.start()
+
+    sniff_thread.start()
+
+    end_time = time.time() + max(1, duration_seconds)
+    while time.time() < end_time:
+        with aps_lock:
+            current_count = packet_count
+        remaining = max(0, int(end_time - time.time()))
+        display_sniffer_live(current_count, remaining, interface)
+        time.sleep(max(0.2, update_interval))
+
+    sniff_thread.join(timeout=2)
+    stop_event.set()
+    if hopper_thread:
+        hopper_thread.join(timeout=2)
+
+    return aps, probe_counts, packet_count
+
+
 def recon_menu(vendors: Dict[str, str]) -> None:
     while True:
         logging.info("")
         logging.info(style("Recon menu:", STYLE_BOLD))
-        logging.info("  %s", color_text("[1] Quick scan (iw)", COLOR_HIGHLIGHT))
         if SCAPY_AVAILABLE:
-            logging.info("  %s", color_text("[2] Monitor scan (scapy)", COLOR_HIGHLIGHT))
+            logging.info("  %s", color_text("[1] Scaner (scapy)", COLOR_HIGHLIGHT))
+            logging.info("  %s", color_text("[2] Sniffer (scapy)", COLOR_HIGHLIGHT))
         else:
-            logging.info("  %s", color_text("[2] Monitor scan (scapy) [missing]", COLOR_WARNING))
+            logging.info("  %s", color_text("[1] Scaner (scapy) [missing]", COLOR_WARNING))
+            logging.info("  %s", color_text("[2] Sniffer (scapy) [missing]", COLOR_WARNING))
         logging.info("  %s", color_text("[3] Back", COLOR_HIGHLIGHT))
 
         choice = input(style("Your choice (1-3): ", STYLE_BOLD)).strip()
@@ -822,18 +993,45 @@ def recon_menu(vendors: Dict[str, str]) -> None:
             return
 
         if choice == "1":
+            if not SCAPY_AVAILABLE:
+                logging.warning("Scapy is not installed. Install with: pip3 install scapy")
+                continue
+
             interfaces = list_network_interfaces()
             interface = select_interface(interfaces)
+
+            original_mode = get_interface_mode(interface)
+            if original_mode != "monitor":
+                logging.info("")
+                input(f"{style('Press Enter', STYLE_BOLD)} to switch {interface} to monitor mode...")
+                if not set_interface_type(interface, "monitor"):
+                    logging.error("Failed to enable monitor mode on %s.", interface)
+                    continue
+
             logging.info("")
             duration = prompt_int(
                 f"{style('Scan duration', STYLE_BOLD)} in seconds "
-                f"({style('Enter', STYLE_BOLD)} for {style('15', COLOR_SUCCESS, STYLE_BOLD)}): ",
-                default=15,
+                f"({style('Enter', STYLE_BOLD)} for {style('12', COLOR_SUCCESS, STYLE_BOLD)}): ",
+                default=12,
             )
+
             logging.info("")
-            input(f"{style('Press Enter', STYLE_BOLD)} to start scanning on {interface}...")
-            networks = scan_wireless_networks_iw(interface, duration_seconds=duration, show_progress=True)
-            display_iw_results(networks, vendors)
+            input(f"{style('Press Enter', STYLE_BOLD)} to start scaner on {interface}...")
+            live_update = lambda snapshot, remaining: display_scapy_live_update(
+                snapshot, vendors, remaining, interface
+            )
+            aps = scan_wireless_networks_scapy(
+                interface,
+                duration,
+                DEFAULT_MONITOR_CHANNELS,
+                DEFAULT_HOP_INTERVAL,
+                update_interval=DEFAULT_LIVE_UPDATE_INTERVAL,
+                on_update=live_update,
+            )
+            display_scapy_results(aps, vendors)
+
+            if original_mode and original_mode != "monitor":
+                restore_managed_mode(interface)
             input(style("Press Enter to return.", STYLE_BOLD))
             continue
 
@@ -855,25 +1053,27 @@ def recon_menu(vendors: Dict[str, str]) -> None:
 
             logging.info("")
             duration = prompt_int(
-                f"{style('Capture duration', STYLE_BOLD)} in seconds "
-                f"({style('Enter', STYLE_BOLD)} for {style('20', COLOR_SUCCESS, STYLE_BOLD)}): ",
-                default=20,
+                f"{style('Sniffer duration', STYLE_BOLD)} in seconds "
+                f"({style('Enter', STYLE_BOLD)} for {style('15', COLOR_SUCCESS, STYLE_BOLD)}): ",
+                default=15,
             )
 
             logging.info("")
-            input(f"{style('Press Enter', STYLE_BOLD)} to start monitor capture on {interface}...")
-            live_update = lambda snapshot, remaining: display_scapy_live_update(
-                snapshot, vendors, remaining, interface
-            )
-            aps = scan_wireless_networks_scapy(
+            input(f"{style('Press Enter', STYLE_BOLD)} to start sniffer on {interface}...")
+            aps, probes, packet_count = run_sniffer(
                 interface,
                 duration,
-                DEFAULT_MONITOR_CHANNELS,
-                DEFAULT_HOP_INTERVAL,
-                update_interval=DEFAULT_LIVE_UPDATE_INTERVAL,
-                on_update=live_update,
+                channels=DEFAULT_MONITOR_CHANNELS,
+                hop_interval=DEFAULT_HOP_INTERVAL,
             )
-            display_scapy_results(aps, vendors)
+
+            logging.info("")
+            logging.info(style(f"Total packets captured: {packet_count}", STYLE_BOLD))
+            for line in format_sniffer_networks_lines(aps, vendors):
+                logging.info("%s", line)
+            logging.info("")
+            for line in format_probe_lines(probes):
+                logging.info("%s", line)
 
             if original_mode and original_mode != "monitor":
                 restore_managed_mode(interface)

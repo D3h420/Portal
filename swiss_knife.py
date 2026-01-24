@@ -19,6 +19,7 @@ COLOR_HEADER = "\033[36m" if COLOR_ENABLED else ""
 COLOR_HIGHLIGHT = "\033[35m" if COLOR_ENABLED else ""
 COLOR_SUCCESS = "\033[32m" if COLOR_ENABLED else ""
 COLOR_ERROR = "\033[31m" if COLOR_ENABLED else ""
+COLOR_DIM = "\033[90m" if COLOR_ENABLED else ""
 STYLE_BOLD = "\033[1m" if COLOR_ENABLED else ""
 
 
@@ -52,7 +53,9 @@ ATTACKS_MENU: Dict[str, Dict[str, str]] = {
     "1": {"name": "Deauth", "file": os.path.join("modules", "deauth.py")},
     "2": {"name": "Portal", "file": os.path.join("modules", "portal.py")},
     "3": {"name": "Evil Twin", "file": os.path.join("modules", "twins.py")},
-    "4": {"name": "Back", "file": ""},
+    "4": {"name": "Handshaker (soon)", "file": "", "disabled": True},
+    "5": {"name": "Karma (soon)", "file": "", "disabled": True},
+    "6": {"name": "Back", "file": ""},
 }
 
 RECON_MENU: Dict[str, Dict[str, str]] = {
@@ -231,7 +234,8 @@ def print_header(title: str, menu: Dict[str, Dict[str, str]]) -> None:
     print()
     for key, meta in menu.items():
         label = f"[{key}] {meta['name']}"
-        print(f"  {color_text(label, COLOR_HIGHLIGHT)}")
+        color = COLOR_DIM if meta.get("disabled") else meta.get("color", COLOR_HIGHLIGHT)
+        print(f"  {color_text(label, color)}")
     print()
 
 
@@ -274,14 +278,18 @@ def recon_menu() -> None:
 def attacks_menu() -> None:
     while True:
         print_header("Attacks:", ATTACKS_MENU)
-        choice = input(style("Your choice (1-4): ", STYLE_BOLD)).strip()
+        choice = input(style("Your choice (1-6): ", STYLE_BOLD)).strip()
 
         if choice not in ATTACKS_MENU:
             print(color_text("Invalid choice, try again.\n", COLOR_HIGHLIGHT))
             continue
 
-        if choice == "4":
+        if choice == "6":
             break
+
+        if ATTACKS_MENU[choice].get("disabled"):
+            print(color_text("Coming soon.", COLOR_HIGHLIGHT))
+            continue
 
         run_child(ATTACKS_MENU[choice]["file"])
 
