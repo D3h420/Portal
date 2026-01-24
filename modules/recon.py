@@ -296,6 +296,17 @@ def shorten_vendor(vendor: Optional[str], max_len: int = 22) -> Optional[str]:
     return cleaned[: max_len - 3].rstrip() + "..."
 
 
+def format_ssid(ssid: Optional[str], max_len: int = 24) -> str:
+    if not ssid:
+        return "<hidden>"
+    cleaned = " ".join(ssid.split())
+    if not cleaned:
+        return "<hidden>"
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 3].rstrip() + "..."
+
+
 def finalize_encryption(privacy: bool, wpa: bool, wpa2: bool, wps: bool) -> str:
     if wpa2:
         encryption = "WPA2"
@@ -472,7 +483,7 @@ def display_iw_results(networks: List[Dict[str, Optional[str]]], vendors: Dict[s
         channel = f"ch {net['channel']}" if net["channel"] else "ch ?"
         encryption = net.get("encryption") or "UNKNOWN"
         bssid = net.get("bssid") or "??"
-        ssid = net.get("ssid") or "<hidden>"
+        ssid = format_ssid(net.get("ssid"))
         vendor = lookup_vendor(bssid, vendors)
         vendor_label = f" | {vendor}" if vendor else ""
         label = f"{index}) {ssid} ({bssid}) -"
@@ -595,15 +606,26 @@ def extract_encryption(packet) -> str:
 
 
 def is_unicast(mac_address: Optional[str]) -> bool:
-    if not mac_address:
-        return False
-    if mac_address.lower() == "ff:ff:ff:ff:ff:ff":
+    if not is_valid_mac(mac_address):
         return False
     try:
         first_octet = int(mac_address.split(":")[0], 16)
     except (ValueError, IndexError):
         return False
     return (first_octet & 1) == 0
+
+
+def is_valid_mac(mac_address: Optional[str]) -> bool:
+    if not mac_address:
+        return False
+    lower = mac_address.lower()
+    if lower in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
+        return False
+    if lower.startswith(("01:00:5e", "01:80:c2", "33:33")):
+        return False
+    if len(lower.split(":")) != 6:
+        return False
+    return True
 
 
 @dataclass
@@ -667,7 +689,7 @@ def scan_wireless_networks_scapy(
 
         if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
             bssid = packet[Dot11].addr3
-            if not bssid:
+            if not bssid or not is_valid_mac(bssid):
                 return
             ssid, _hidden = extract_ssid(packet)
             channel = extract_channel(packet)
@@ -768,7 +790,7 @@ def format_scapy_results_lines(aps: Dict[str, AccessPoint], vendors: Dict[str, s
         rssi = f"{ap.rssi} dBm" if ap.rssi is not None else "rssi ?"
         clients = f"clients {len(ap.clients)}"
         vendor = shorten_vendor(lookup_vendor(ap.bssid, vendors))
-        label = f"{index}) {ap.ssid} ({ap.bssid}) -"
+        label = f"{index}) {format_ssid(ap.ssid)} ({ap.bssid}) -"
         details = f"{channel} | {ap.encryption} | {rssi} | {clients}"
         if vendor:
             details += f" | {vendor}"
@@ -891,7 +913,7 @@ def format_sniffer_networks_lines(aps: Dict[str, AccessPoint], vendors: Dict[str
         if client_list:
             client_label += f" ({client_list})"
         vendor = shorten_vendor(lookup_vendor(ap.bssid, vendors))
-        label = f"{index}) {ap.ssid} ({ap.bssid}) -"
+        label = f"{index}) {format_ssid(ap.ssid)} ({ap.bssid}) -"
         details = f"{channel} | {ap.encryption} | {rssi} | {client_label}"
         if vendor:
             details += f" | {vendor}"
@@ -933,7 +955,7 @@ def run_sniffer(
 
         if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
             bssid = packet[Dot11].addr3
-            if not bssid:
+            if not bssid or not is_valid_mac(bssid):
                 return
             ssid, _hidden = extract_ssid(packet)
             channel = extract_channel(packet)

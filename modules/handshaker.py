@@ -20,9 +20,6 @@ COLOR_ERROR = "\033[31m" if COLOR_ENABLED else ""
 COLOR_DIM = "\033[90m" if COLOR_ENABLED else ""
 STYLE_BOLD = "\033[1m" if COLOR_ENABLED else ""
 
-MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(MODULE_DIR)
-
 DEFAULT_MONITOR_CHANNELS = (
     list(range(1, 15))
     + [
@@ -189,6 +186,19 @@ def restore_managed_mode(interface: str) -> None:
         pass
 
 
+def prompt_int(prompt: str, default: int, minimum: int = 1) -> int:
+    raw = input(prompt).strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < minimum:
+        return minimum
+    return value
+
+
 def build_box(lines: List[str]) -> str:
     width = max(len(line) for line in lines)
     border = "+" + "-" * (width + 2) + "+"
@@ -196,13 +206,19 @@ def build_box(lines: List[str]) -> str:
     return "\n".join([border, *body, border])
 
 
-def display_scan_live(networks: int, clients: int, interface: str, status: str) -> None:
+def display_scan_live(
+    networks: int,
+    clients: int,
+    interface: str,
+    status: str,
+    remaining: int,
+) -> None:
     lines = [
         f"Handshaker scan on {interface}",
         f"Networks: {networks}",
         f"Clients:  {clients}",
         f"Status:   {status.upper()}",
-        "Press Enter to stop.",
+        f"Time left: {remaining}s",
     ]
     output = build_box(lines)
     if COLOR_ENABLED:
@@ -210,6 +226,17 @@ def display_scan_live(networks: int, clients: int, interface: str, status: str) 
     else:
         sys.stdout.write(output + "\n")
     sys.stdout.flush()
+
+
+def format_ssid(ssid: str, max_len: int = 24) -> str:
+    if not ssid:
+        return "<hidden>"
+    cleaned = " ".join(ssid.split())
+    if not cleaned:
+        return "<hidden>"
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 3].rstrip() + "..."
 
 
 def extract_ssid(packet) -> str:
@@ -283,15 +310,26 @@ def extract_security(packet) -> str:
 
 
 def is_unicast(mac_address: Optional[str]) -> bool:
-    if not mac_address:
-        return False
-    if mac_address.lower() == "ff:ff:ff:ff:ff:ff":
+    if not is_valid_mac(mac_address):
         return False
     try:
         first_octet = int(mac_address.split(":")[0], 16)
     except (ValueError, IndexError):
         return False
     return (first_octet & 1) == 0
+
+
+def is_valid_mac(mac_address: Optional[str]) -> bool:
+    if not mac_address:
+        return False
+    lower = mac_address.lower()
+    if lower in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
+        return False
+    if lower.startswith(("01:00:5e", "01:80:c2", "33:33")):
+        return False
+    if len(lower.split(":")) != 6:
+        return False
+    return True
 
 
 @dataclass
@@ -325,7 +363,7 @@ def channel_hopper(interface: str, channels: List[int], interval: float, stop_ev
 
 def scan_networks(
     interface: str,
-    stop_event: threading.Event,
+    duration_seconds: int,
     channels: List[int],
     hop_interval: float,
     update_interval: float,
@@ -339,7 +377,7 @@ def scan_networks(
 
         if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
             bssid = packet[Dot11].addr3
-            if not bssid:
+            if not bssid or not is_valid_mac(bssid):
                 return
             ssid = extract_ssid(packet)
             security = extract_security(packet)
@@ -391,6 +429,7 @@ def scan_networks(
 
     start_sniffer()
 
+    stop_event = threading.Event()
     hopper_thread: Optional[threading.Thread] = None
     if channels:
         hopper_thread = threading.Thread(
@@ -398,15 +437,18 @@ def scan_networks(
         )
         hopper_thread.start()
 
-    while not stop_event.is_set():
+    end_time = time.time() + max(1, duration_seconds)
+    while time.time() < end_time:
         if sniffer is None or not getattr(sniffer, "running", False):
             start_sniffer()
         with aps_lock:
             networks = len(aps)
             clients = sum(len(ap.clients) for ap in aps.values())
-        display_scan_live(networks, clients, interface, status)
+        remaining = max(0, int(end_time - time.time()))
+        display_scan_live(networks, clients, interface, status, remaining)
         time.sleep(max(0.2, update_interval))
 
+    stop_event.set()
     try:
         if sniffer and getattr(sniffer, "running", False):
             sniffer.stop()
@@ -435,23 +477,9 @@ def format_network_lines(aps: Dict[str, AccessPoint]) -> List[str]:
             color = COLOR_ERROR
         else:
             color = COLOR_DIM
-        label = f"{index}) {ap.ssid}"
+        label = f"{index}) {format_ssid(ap.ssid)}"
         details = f"{ap.security} | clients {len(ap.clients)}"
         lines.append(f"  {color_text(label, color)} {details}")
-    return lines
-
-
-def format_network_lines_plain(aps: Dict[str, AccessPoint]) -> List[str]:
-    if not aps:
-        return ["No networks found."]
-
-    def sort_key(ap: AccessPoint) -> int:
-        return len(ap.clients)
-
-    sorted_aps = sorted(aps.values(), key=sort_key, reverse=True)
-    lines: List[str] = ["Observed networks:"]
-    for index, ap in enumerate(sorted_aps, start=1):
-        lines.append(f"{index}) {ap.ssid} | {ap.security} | clients {len(ap.clients)}")
     return lines
 
 
@@ -491,27 +519,20 @@ def main() -> None:
             sys.exit(1)
 
     logging.info("")
+    duration = prompt_int(
+        f"{style('Scan duration', STYLE_BOLD)} in seconds "
+        f"({style('Enter', STYLE_BOLD)} for {style('15', COLOR_SUCCESS, STYLE_BOLD)}): ",
+        default=15,
+    )
+    logging.info("")
     input(f"{style('Press Enter', STYLE_BOLD)} to start scanning on {interface}...")
-    stop_event = threading.Event()
-
-    def wait_for_stop() -> None:
-        try:
-            input()
-        except EOFError:
-            pass
-        stop_event.set()
-
-    stopper = threading.Thread(target=wait_for_stop, daemon=True)
-    stopper.start()
-
     aps = scan_networks(
         interface,
-        stop_event,
+        duration,
         channels=DEFAULT_MONITOR_CHANNELS,
         hop_interval=DEFAULT_HOP_INTERVAL,
         update_interval=DEFAULT_UPDATE_INTERVAL,
     )
-    stopper.join(timeout=1)
 
     logging.info("")
     for line in format_network_lines(aps):
