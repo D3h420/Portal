@@ -140,6 +140,43 @@ def set_interface_type(interface: str, mode: str) -> bool:
         return False
 
 
+def is_interface_up(interface: str) -> bool:
+    result = subprocess.run(
+        ["ip", "-o", "link", "show", interface],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    line = result.stdout.strip()
+    return "state UP" in line or "state UNKNOWN" in line
+
+
+def ensure_interface_up(interface: str) -> None:
+    if is_interface_up(interface):
+        return
+    subprocess.run(["ip", "link", "set", interface, "up"], check=False, stderr=subprocess.DEVNULL)
+    time.sleep(0.2)
+
+
+def set_channel(interface: str, channel: Optional[int]) -> bool:
+    if not channel:
+        return True
+    result = subprocess.run(
+        ["iw", "dev", interface, "set", "channel", str(channel)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        logging.warning("Failed to set channel %s on %s: %s", channel, interface, result.stderr.strip() or "unknown error")
+        return False
+    return True
+
+
 def scan_wireless_networks(
     interface: str,
     duration_seconds: int = 15,
@@ -317,8 +354,8 @@ def enable_monitor_mode(interface: str, channel: Optional[int]) -> bool:
     try:
         if not set_interface_type(interface, "monitor"):
             return False
-        if channel:
-            subprocess.run(["iw", "dev", interface, "set", "channel", str(channel)], stderr=subprocess.DEVNULL)
+        ensure_interface_up(interface)
+        set_channel(interface, channel)
         if not is_monitor_mode(interface):
             current_mode = get_interface_mode(interface)
             logging.error(
@@ -352,8 +389,12 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
         logging.error("Missing target BSSID; cannot start attack.")
         return False
 
-    if channel:
-        subprocess.run(["iw", "dev", interface, "set", "channel", str(channel)], stderr=subprocess.DEVNULL)
+    if not is_monitor_mode(interface):
+        logging.warning("Interface is not in monitor mode; re-enabling.")
+        if not enable_monitor_mode(interface, channel):
+            return False
+    ensure_interface_up(interface)
+    set_channel(interface, channel)
 
     try:
         ATTACK_PROCESS = subprocess.Popen(
@@ -438,6 +479,9 @@ def run_deauth_session() -> bool:
         logging.warning("Interface left monitor mode; re-enabling.")
         if not enable_monitor_mode(SELECTED_INTERFACE, target_network.get("channel")):
             return False
+    else:
+        ensure_interface_up(SELECTED_INTERFACE)
+        set_channel(SELECTED_INTERFACE, target_network.get("channel"))
 
     logging.info("")
     input(
