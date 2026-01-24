@@ -58,7 +58,15 @@ DEFAULT_HOP_INTERVAL = 0.8
 DEFAULT_LIVE_UPDATE_INTERVAL = 0.5
 
 try:
-    from scapy.all import Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeReq, Dot11ProbeResp, sniff  # type: ignore
+    from scapy.all import (  # type: ignore
+        AsyncSniffer,
+        Dot11,
+        Dot11Beacon,
+        Dot11Elt,
+        Dot11ProbeReq,
+        Dot11ProbeResp,
+        sniff,
+    )
     SCAPY_AVAILABLE = True
 except Exception:
     SCAPY_AVAILABLE = False
@@ -824,14 +832,12 @@ def format_client_list(clients: Set[str], max_items: int = 3) -> str:
     return f"{shown} +{remaining}"
 
 
-def display_sniffer_live(packet_count: int, remaining: int, interface: str) -> None:
+def display_sniffer_live(packet_count: int, probe_count: int, interface: str) -> None:
     header = style(f"Sniffer on {interface}", STYLE_BOLD)
-    progress = (
-        f"{style('Listening', STYLE_BOLD)}... "
-        f"{style(str(remaining), COLOR_SUCCESS, STYLE_BOLD)}s remaining"
-    )
     count_line = f"{style('Packets', STYLE_BOLD)}: {style(str(packet_count), COLOR_SUCCESS, STYLE_BOLD)}"
-    output = "\n".join([header, progress, count_line])
+    probe_line = f"{style('Probes', STYLE_BOLD)}: {style(str(probe_count), COLOR_SUCCESS, STYLE_BOLD)}"
+    hint_line = style("Press Enter to stop.", STYLE_BOLD)
+    output = "\n".join([header, count_line, probe_line, hint_line])
     if COLOR_ENABLED:
         sys.stdout.write("\033[2J\033[H" + output + "\n")
     else:
@@ -879,18 +885,19 @@ def format_probe_lines(probe_counts: Dict[str, int]) -> List[str]:
 
 def run_sniffer(
     interface: str,
-    duration_seconds: int,
+    stop_event: threading.Event,
     channels: Optional[List[int]] = None,
     hop_interval: float = DEFAULT_HOP_INTERVAL,
     update_interval: float = 1.0,
 ) -> Tuple[Dict[str, AccessPoint], Dict[str, int], int]:
     aps: Dict[str, AccessPoint] = {}
     probe_counts: Dict[str, int] = {}
+    probe_total = 0
     packet_count = 0
     aps_lock = threading.Lock()
 
     def handle_packet(packet) -> None:
-        nonlocal packet_count
+        nonlocal packet_count, probe_total
         with aps_lock:
             packet_count += 1
 
@@ -936,6 +943,7 @@ def run_sniffer(
             if not hidden and ssid not in ("<hidden>", "<non-printable>"):
                 with aps_lock:
                     probe_counts[ssid] = probe_counts.get(ssid, 0) + 1
+                    probe_total += 1
 
         sender = packet.addr2
         receiver = packet.addr1
@@ -945,12 +953,7 @@ def run_sniffer(
             if receiver in aps and is_unicast(sender):
                 aps[receiver].clients.add(sender)
 
-    sniff_thread = threading.Thread(
-        target=sniff,
-        kwargs={"iface": interface, "prn": handle_packet, "store": False, "timeout": duration_seconds},
-        daemon=True,
-    )
-    stop_event = threading.Event()
+    sniffer = AsyncSniffer(iface=interface, prn=handle_packet, store=False)
     hopper_thread: Optional[threading.Thread] = None
     if channels:
         hopper_thread = threading.Thread(
@@ -958,17 +961,16 @@ def run_sniffer(
         )
         hopper_thread.start()
 
-    sniff_thread.start()
+    sniffer.start()
 
-    end_time = time.time() + max(1, duration_seconds)
-    while time.time() < end_time:
+    while not stop_event.is_set():
         with aps_lock:
             current_count = packet_count
-        remaining = max(0, int(end_time - time.time()))
-        display_sniffer_live(current_count, remaining, interface)
+            current_probe_total = probe_total
+        display_sniffer_live(current_count, current_probe_total, interface)
         time.sleep(max(0.2, update_interval))
 
-    sniff_thread.join(timeout=2)
+    sniffer.stop()
     stop_event.set()
     if hopper_thread:
         hopper_thread.join(timeout=2)
@@ -1052,17 +1054,19 @@ def recon_menu(vendors: Dict[str, str]) -> None:
                     continue
 
             logging.info("")
-            duration = prompt_int(
-                f"{style('Sniffer duration', STYLE_BOLD)} in seconds "
-                f"({style('Enter', STYLE_BOLD)} for {style('15', COLOR_SUCCESS, STYLE_BOLD)}): ",
-                default=15,
-            )
-
-            logging.info("")
             input(f"{style('Press Enter', STYLE_BOLD)} to start sniffer on {interface}...")
+            stop_event = threading.Event()
+
+            def wait_for_stop() -> None:
+                input()
+                stop_event.set()
+
+            stopper = threading.Thread(target=wait_for_stop, daemon=True)
+            stopper.start()
+
             aps, probes, packet_count = run_sniffer(
                 interface,
-                duration,
+                stop_event,
                 channels=DEFAULT_MONITOR_CHANNELS,
                 hop_interval=DEFAULT_HOP_INTERVAL,
             )

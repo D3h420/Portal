@@ -58,10 +58,7 @@ ATTACKS_MENU: Dict[str, Dict[str, str]] = {
     "6": {"name": "Back", "file": ""},
 }
 
-RECON_MENU: Dict[str, Dict[str, str]] = {
-    "1": {"name": "Wireless Recon", "file": os.path.join("modules", "recon.py")},
-    "2": {"name": "Back", "file": ""},
-}
+RECON_SCRIPT = os.path.join("modules", "recon.py")
 
 REQUIRED_TOOLS: List[str] = [
     "iw",
@@ -261,20 +258,6 @@ def run_child(script_file: str) -> None:
         pass
 
 
-def recon_menu() -> None:
-    while True:
-        print_header("Recon:", RECON_MENU)
-        choice = input(style("Your choice (1-2): ", STYLE_BOLD)).strip()
-
-        if choice not in RECON_MENU:
-            print(color_text("Invalid choice, try again.\n", COLOR_HIGHLIGHT))
-            continue
-
-        if choice == "2":
-            break
-        run_child(RECON_MENU[choice]["file"])
-
-
 def attacks_menu() -> None:
     while True:
         print_header("Attacks:", ATTACKS_MENU)
@@ -315,7 +298,7 @@ def main() -> None:
             break
 
         if choice == "1":
-            recon_menu()
+            run_child(RECON_SCRIPT)
             continue
 
         if choice == "2":
