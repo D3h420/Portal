@@ -668,13 +668,7 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
         logging.error("Missing target BSSID; cannot start attack.")
         return False
 
-    # Test injection first
-    if not test_packet_injection(interface):
-        logging.error(color_text("✗ Packet injection test failed!", COLOR_ERROR))
-        logging.info("Check if: 1) Interface is in monitor mode 2) Driver supports injection")
-        return False
-
-    # Set channel
+    # Set channel FIRST (before any tests)
     if channel:
         logging.info(color_text(f"\n[SETUP] Setting channel {channel}...", COLOR_HEADER))
         for attempt in range(3):
@@ -690,6 +684,11 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
             else:
                 logging.warning(f"Attempt {attempt+1} failed: {result.stderr.strip()}")
                 time.sleep(1)
+
+    # Test injection (non-blocking - just a warning if it fails)
+    if not test_packet_injection(interface):
+        logging.warning(color_text("⚠ Packet injection test failed, continuing anyway...", COLOR_WARNING))
+        logging.info("Note: Some drivers don't respond to injection tests but still work.")
 
     # Find connected clients (optional but recommended)
     clients = []
