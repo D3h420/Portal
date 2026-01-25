@@ -720,7 +720,7 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
                 ATTACK_RUNNING = True
                 
                 # Show attack stats
-                logging.info(style(color_text("\n[ATTACK ACTIVE]", COLOR_SUCCESS), STYLE_BOLD))
+                logging.info(style("\n[ATTACK ACTIVE]", COLOR_SUCCESS, STYLE_BOLD))
                 logging.info(f"• Target: {bssid}")
                 logging.info(f"• Channel: {channel}")
                 logging.info(f"• Method: {method_name}")
@@ -948,7 +948,7 @@ def main() -> None:
             logging.info(color_text("Exiting Deauth Wizard.", COLOR_HEADER))
             break
         logging.info(color_text("\n" + "="*60, COLOR_HEADER))
-        logging.info(style(color_text("RESTARTING DEAUTH WIZARD...", COLOR_HEADER), STYLE_BOLD))
+        logging.info(color_text("RESTARTING DEAUTH WIZARD...", COLOR_HEADER, STYLE_BOLD))
         logging.info(color_text("="*60 + "\n", COLOR_HEADER))
 
 
