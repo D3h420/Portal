@@ -886,13 +886,11 @@ def run_deauth_session() -> bool:
     SELECTED_INTERFACE = select_interface(interfaces)
 
     logging.info("")
-    current_mode = get_interface_mode(SELECTED_INTERFACE)
-    if current_mode != "managed":
-        input(
-            f"{style('Press Enter', STYLE_BOLD)} to switch {SELECTED_INTERFACE} to managed mode for scanning..."
-        )
-        if not set_interface_mode(SELECTED_INTERFACE, "managed"):
-            return False
+    input(
+        f"{style('Press Enter', STYLE_BOLD)} to switch {SELECTED_INTERFACE} to managed mode for scanning..."
+    )
+    if not set_interface_mode(SELECTED_INTERFACE, "managed"):
+        return False
     logging.info(color_text("✓ Managed mode confirmed", COLOR_SUCCESS))
 
     logging.info("")
