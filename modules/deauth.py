@@ -188,6 +188,119 @@ def is_interface_up(interface: str) -> bool:
     return False
 
 
+def get_wireless_interfaces() -> List[str]:
+    result = subprocess.run(
+        ["iw", "dev"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    interfaces: List[str] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if line.startswith("Interface "):
+            name = line.split("Interface", 1)[1].strip()
+            if name:
+                interfaces.append(name)
+    return interfaces
+
+
+def get_active_wifi_links() -> List[Dict[str, Optional[str]]]:
+    links: List[Dict[str, Optional[str]]] = []
+    for iface in get_wireless_interfaces():
+        result = subprocess.run(
+            ["iw", "dev", iface, "link"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            continue
+        if "Not connected." in result.stdout:
+            continue
+        bssid = None
+        ssid = None
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if line.startswith("Connected to "):
+                parts = line.split()
+                if len(parts) >= 3:
+                    bssid = parts[2].lower()
+                continue
+            if line.startswith("SSID:"):
+                ssid_val = line.split(":", 1)[1].strip()
+                ssid = ssid_val if ssid_val else "<hidden>"
+        if bssid or ssid:
+            links.append({"interface": iface, "bssid": bssid, "ssid": ssid})
+    return links
+
+
+def get_ssh_client_ip() -> Optional[str]:
+    ssh_conn = os.environ.get("SSH_CONNECTION")
+    if ssh_conn:
+        return ssh_conn.split()[0] if ssh_conn.split() else None
+    ssh_client = os.environ.get("SSH_CLIENT")
+    if ssh_client:
+        return ssh_client.split()[0] if ssh_client.split() else None
+    return None
+
+
+def get_route_interface(ip_address: str) -> Optional[str]:
+    if not ip_address:
+        return None
+    result = subprocess.run(
+        ["ip", "route", "get", ip_address],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    tokens = result.stdout.split()
+    if "dev" in tokens:
+        idx = tokens.index("dev")
+        if idx + 1 < len(tokens):
+            return tokens[idx + 1]
+    return None
+
+
+def get_deauth_safety_block_reason(
+    target: Dict[str, Optional[str]],
+    attack_interface: str,
+) -> Optional[str]:
+    ssh_ip = get_ssh_client_ip()
+    if ssh_ip:
+        ssh_iface = get_route_interface(ssh_ip)
+        if ssh_iface and ssh_iface == attack_interface:
+            return (
+                f"SSH session uses {attack_interface}; switching to monitor mode will drop your connection."
+            )
+    target_bssid = target.get("bssid")
+    target_ssid = target.get("ssid")
+    if target_bssid:
+        target_bssid = target_bssid.lower()
+    active_links = get_active_wifi_links()
+    for link in active_links:
+        link_bssid = (link.get("bssid") or "").lower()
+        link_ssid = link.get("ssid")
+        if target_bssid and link_bssid and target_bssid == link_bssid:
+            return (
+                f"Target BSSID matches active Wi-Fi link on {link.get('interface')}; "
+                "deauth will likely drop your SSH connection."
+            )
+        if target_ssid and link_ssid and target_ssid == link_ssid:
+            return (
+                f"Target SSID matches active Wi-Fi link on {link.get('interface')}; "
+                "deauth will likely drop your SSH connection."
+            )
+    return None
+
+
 def wait_for_interface_mode(interface: str, target: str, timeout_seconds: float = 6.0) -> bool:
     end_time = time.time() + max(0.5, timeout_seconds)
     while time.time() < end_time:
@@ -1094,6 +1207,10 @@ def run_deauth_session() -> bool:
     logging.info("")
     input(f"{style('Press Enter', STYLE_BOLD)} to scan networks on {SELECTED_INTERFACE}...")
     target_network = select_network(SELECTED_INTERFACE, scan_seconds)
+    block_reason = get_deauth_safety_block_reason(target_network, SELECTED_INTERFACE)
+    if block_reason:
+        logging.warning(color_text("Safety warning:", COLOR_WARNING))
+        logging.warning("%s", block_reason)
     logging.info("")
     logging.info(
         "Target selected: %s (%s) on channel %s",
