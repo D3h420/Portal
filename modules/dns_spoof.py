@@ -337,6 +337,33 @@ def resolve_mac(ip_addr: str, interface: str, timeout: float = 2.0) -> Optional[
     return None
 
 
+def get_neighbor_mac(ip_addr: str, interface: str) -> Optional[str]:
+    result = subprocess.run(
+        ["ip", "neigh", "show", "dev", interface],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    for line in result.stdout.splitlines():
+        if not line.startswith(f"{ip_addr} "):
+            continue
+        parts = line.split()
+        if "lladdr" in parts:
+            try:
+                return parts[parts.index("lladdr") + 1]
+            except (ValueError, IndexError):
+                continue
+    return None
+
+
+def resolve_mac_with_fallback(ip_addr: str, interface: str) -> Optional[str]:
+    mac = resolve_mac(ip_addr, interface)
+    if mac:
+        return mac
+    return get_neighbor_mac(ip_addr, interface)
+
+
 def resolve_hostname(ip_addr: str) -> str:
     try:
         hostname = socket.gethostbyaddr(ip_addr)[0]
@@ -375,6 +402,22 @@ def restore_ip_forwarding(original: Optional[str]) -> None:
 
 def is_tool_available(tool: str) -> bool:
     return subprocess.run(["which", tool], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def run_nmtui() -> bool:
+    if not is_tool_available("nmtui"):
+        logging.warning("nmtui not available.")
+        return False
+    if not sys.stdin.isatty():
+        logging.warning("nmtui requires a TTY.")
+        return False
+    logging.info("Launching nmtui... exit to return here.")
+    try:
+        subprocess.run(["nmtui"], check=False)
+    except Exception as exc:
+        logging.error("Failed to launch nmtui: %s", exc)
+        return False
+    return True
 
 
 def is_scan_busy_error(stderr: str) -> bool:
@@ -802,11 +845,23 @@ def ensure_interface_connected(interface: str) -> Optional[str]:
         return None
     ensure_interface_ready_for_wifi(interface)
 
+    if is_tool_available("nmtui"):
+        choice = input(
+            f"{style('Interface not connected.', STYLE_BOLD)} "
+            f"{style('Open nmtui', STYLE_BOLD)}? (Y/N): "
+        ).strip().lower()
+        if choice in {"", "y", "yes"}:
+            if run_nmtui():
+                cidr = get_interface_ipv4_cidr(interface)
+                if cidr:
+                    return cidr
+
     while True:
         logging.info("")
         method = input(
             f"{style('Connect', STYLE_BOLD)} - "
-            f"{style('Scan', STYLE_BOLD)} (S) or {style('Manual', STYLE_BOLD)} (M): "
+            f"{style('Scan', STYLE_BOLD)} (S), {style('Manual', STYLE_BOLD)} (M), "
+            f"or {style('nmtui', STYLE_BOLD)} (N): "
         ).strip().lower()
         hidden = False
         if method in {"s", "scan", ""}:
@@ -823,8 +878,15 @@ def ensure_interface_connected(interface: str) -> Optional[str]:
         elif method in {"m", "manual"}:
             ssid = prompt_manual_ssid()
             hidden = True
+        elif method in {"n", "nmtui"}:
+            if run_nmtui():
+                cidr = get_interface_ipv4_cidr(interface)
+                if cidr:
+                    return cidr
+            logging.warning("No IPv4 address detected after nmtui.")
+            continue
         else:
-            logging.warning("Please enter S or M.")
+            logging.warning("Please enter S, M, or N.")
             continue
 
         password = prompt_wifi_password(ssid)
@@ -1275,10 +1337,25 @@ def run_dns_spoof_session() -> None:
             continue
         logging.warning("Please enter S or M.")
 
-    gateway_mac = resolve_mac(gateway_ip, interface)
+    gateway_mac = resolve_mac_with_fallback(gateway_ip, interface)
     if not gateway_mac:
-        logging.error("Could not resolve gateway MAC for %s", gateway_ip)
-        sys.exit(1)
+        logging.warning("Could not resolve gateway MAC for %s.", gateway_ip)
+        if is_tool_available("nmtui"):
+            retry_choice = input(f"{style('Open nmtui', STYLE_BOLD)} to fix connection? (Y/N): ").strip().lower()
+            if retry_choice in {"", "y", "yes"}:
+                run_nmtui()
+                cidr = ensure_interface_connected(interface)
+                if not cidr:
+                    logging.error("No IPv4 address found on %s. Connect first and retry.", interface)
+                    sys.exit(1)
+                local_ip = str(ipaddress.ip_interface(cidr).ip)
+                gateway_ip = wait_for_gateway(interface, timeout=6.0)
+                if not gateway_ip:
+                    gateway_ip = prompt_gateway_with_help(interface, cidr, local_ip)
+        gateway_mac = resolve_mac_with_fallback(gateway_ip, interface)
+        if not gateway_mac:
+            logging.error("Could not resolve gateway MAC for %s", gateway_ip)
+            sys.exit(1)
 
     attacker_mac = get_interface_mac(interface)
     if not attacker_mac:
