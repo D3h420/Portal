@@ -2,9 +2,18 @@
 
 # SwissKnife 🧰
 
-Wireless "swiss knife" that bundles three workflows into one menu-driven tool:
-Recon, Deauth, Captive Portal, and Evil Twin. The main entry point is `swiss_knife.py`.
-Control the chaos with [Lab5](https://github.com/C5Lab) (responsibly).
+Wireless "swiss knife" that bundles multiple workflows into one menu-driven tool.
+The main entry point is `swiss_knife.py`. Control the chaos with
+[Lab5](https://github.com/C5Lab) (responsibly).
+
+## Functions ✨
+
+- Recon - passive discovery of nearby APs/clients
+- Deauth - network deauthentication workflow
+- Portal - phishing-style portal with logging
+- Evil Twin - rogue AP + portal workflow
+- <span style="color: #8a8a8a;">Handshaker - PCAP capture</span> <span style="color: #ffffff;">(🚧 under construction 🚧)</span>
+- <span style="color: #8a8a8a;">Karma - rogue AP auto-responder</span> <span style="color: #ffffff;">(🚧 under construction 🚧)</span>
 
 ## Quick start ⚡
 
@@ -36,6 +45,7 @@ under `html/` is safe to modify for UI tweaks or branding.
 - `modules/deauth.py` - deauth attack workflow
 - `modules/portal.py` - captive portal workflow
 - `modules/twins.py` - evil twin workflow
+- `modules/handshaker.py` - handshake-focused scan (WIP)
 - `html/` - portal UI templates
 - `log/` - captured submissions (created at runtime)
 - `modules/oui.txt` - optional vendor database for recon (place your own)
@@ -51,13 +61,19 @@ Tools used by the modules:
 - `iw`
 - `ip` (from `iproute2`)
 - `ethtool`
+- `iwlist` (from `wireless-tools`)
 - `aireplay-ng` (Aircrack-ng suite)
 - `hostapd`
 - `dnsmasq`
 - `iptables`
 
+Optional tools:
+- `airodump-ng` (Aircrack-ng suite)
+- `mdk4`
+- `bully`
+
 Optional for recon:
-- `scapy` (enables monitor-mode sniffing)
+- `scapy` (required for Handshaker, optional for recon)
 
 ## Recon vendor lookup (optional)
 
