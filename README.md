@@ -12,8 +12,8 @@ The main entry point is `swiss_knife.py`. Control the chaos with
 - Deauth - network deauthentication workflow
 - Portal - phishing-style portal with logging
 - Evil Twin - rogue AP + portal workflow
-- <span style="color: #8a8a8a;">Handshaker - PCAP capture</span> <span style="color: #ffffff;">(🚧 under construction 🚧)</span>
-- <span style="color: #8a8a8a;">Karma - rogue AP auto-responder</span> <span style="color: #ffffff;">(🚧 under construction 🚧)</span>
+- ~~Handshaker - PCAP capture~~ (🚧 under construction 🚧)
+- ~~Karma - rogue AP auto-responder~~ (🚧 under construction 🚧)
 
 ## Quick start ⚡
 
@@ -36,19 +36,6 @@ first run). Filenames are based on the selected SSID.
 
 The portal page is plain HTML and easy to edit in `html/portal.html`. Everything
 under `html/` is safe to modify for UI tweaks or branding.
-
-## Project layout 🗂️
-
-- `swiss_knife.py` - main launcher and menu
-- `modules/` - secondary modules (recon + attacks)
-- `modules/recon.py` - passive recon (iw/scapy scans)
-- `modules/deauth.py` - deauth attack workflow
-- `modules/portal.py` - captive portal workflow
-- `modules/twins.py` - evil twin workflow
-- `modules/handshaker.py` - handshake-focused scan (WIP)
-- `html/` - portal UI templates
-- `log/` - captured submissions (created at runtime)
-- `modules/oui.txt` - optional vendor database for recon (place your own)
 
 ## Requirements 🧩
 
