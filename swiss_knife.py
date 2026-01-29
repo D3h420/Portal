@@ -59,6 +59,7 @@ ATTACKS_MENU: Dict[str, Dict[str, str]] = {
     "mitm": {"name": "-MITM-", "separator": True},
     "6": {"name": "HTTP Sniffer", "file": os.path.join("modules", "http_sniffer.py")},
     "7": {"name": "ARP Spoof", "file": os.path.join("modules", "arp_spoof.py")},
+    "spacer": {"name": "", "separator": True},
     "8": {"name": "Back", "file": ""},
 }
 
@@ -235,7 +236,11 @@ def print_header(title: str, menu: Dict[str, Dict[str, str]]) -> None:
     print()
     for key, meta in menu.items():
         if meta.get("separator"):
-            print(f"  {color_text(meta['name'], COLOR_DIM)}")
+            name = meta.get("name", "")
+            if name:
+                print(f"  {color_text(name, COLOR_DIM)}")
+            else:
+                print()
             continue
         label = f"[{key}] {meta['name']}"
         color = COLOR_DIM if meta.get("disabled") else meta.get("color", COLOR_HIGHLIGHT)

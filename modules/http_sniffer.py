@@ -5,8 +5,9 @@ import sys
 import time
 import logging
 import subprocess
+import shutil
 from datetime import datetime
-from typing import List, Optional, TextIO, Tuple
+from typing import List, Optional, TextIO, Tuple, Dict
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -85,6 +86,33 @@ def get_interface_chipset(interface: str) -> str:
     return "unknown"
 
 
+def bring_interface_up(interface: str) -> None:
+    subprocess.run(["ip", "link", "set", interface, "up"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def get_interface_ipv4(interface: str) -> Optional[Tuple[str, int]]:
+    result = subprocess.run(
+        ["ip", "-4", "addr", "show", "dev", interface],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("inet "):
+            addr = line.split()[1]
+            if "/" in addr:
+                ip_str, prefix_str = addr.split("/", 1)
+                try:
+                    return ip_str, int(prefix_str)
+                except ValueError:
+                    return None
+    return None
+
+
 def get_default_interface() -> Optional[str]:
     result = subprocess.run(
         ["ip", "route", "show", "default"],
@@ -102,6 +130,141 @@ def get_default_interface() -> Optional[str]:
             if idx + 1 < len(parts):
                 return parts[idx + 1]
     return None
+
+
+def nmcli_available() -> bool:
+    return shutil.which("nmcli") is not None
+
+
+def nmcli_unescape(value: str) -> str:
+    return value.replace("\\:", ":").replace("\\\\", "\\")
+
+
+def list_wifi_networks(interface: str) -> List[Dict[str, str]]:
+    result = subprocess.run(
+        ["nmcli", "-t", "-f", "SSID,SECURITY,SIGNAL", "dev", "wifi", "list", "ifname", interface],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        logging.warning("Wi-Fi scan failed: %s", result.stderr.strip() or "unknown error")
+        return []
+
+    networks: Dict[str, Dict[str, str]] = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.rsplit(":", 2)
+        if len(parts) != 3:
+            continue
+        ssid_raw, security, signal_raw = parts
+        ssid = nmcli_unescape(ssid_raw)
+        if not ssid:
+            continue
+        try:
+            signal = int(signal_raw)
+        except ValueError:
+            signal = -1
+        existing = networks.get(ssid)
+        if not existing or signal > int(existing.get("signal", "-1")):
+            networks[ssid] = {"ssid": ssid, "security": security, "signal": str(signal)}
+
+    return sorted(networks.values(), key=lambda item: int(item.get("signal", "-1")), reverse=True)
+
+
+def prompt_yes_no(message: str, default_yes: bool = True) -> bool:
+    try:
+        response = input(style(message, STYLE_BOLD)).strip().lower()
+    except EOFError:
+        return default_yes
+    if not response:
+        return default_yes
+    return response in {"y", "yes"}
+
+
+def connect_with_nmcli(interface: str) -> bool:
+    networks = list_wifi_networks(interface)
+    if networks:
+        logging.info("")
+        logging.info(style("Available Wi-Fi networks:", STYLE_BOLD))
+        for idx, network in enumerate(networks, start=1):
+            ssid = network["ssid"]
+            security = network["security"] or "--"
+            signal = network["signal"]
+            signal_label = f"{signal}%" if signal.isdigit() and int(signal) >= 0 else "?"
+            logging.info(
+                "  %s %s %s %s",
+                color_text(f"{idx})", COLOR_HIGHLIGHT),
+                ssid.ljust(28),
+                security.ljust(14),
+                signal_label,
+            )
+    else:
+        logging.warning("No Wi-Fi networks found (or scan failed).")
+
+    while True:
+        choice = input(
+            f"{style('Select network', STYLE_BOLD)} (number, M manual, Enter to cancel): "
+        ).strip().lower()
+        if not choice:
+            return False
+        if choice == "m":
+            ssid = input(f"{style('SSID', STYLE_BOLD)}: ").strip()
+            if not ssid:
+                logging.warning("SSID cannot be empty.")
+                continue
+            security = "manual"
+            break
+        if choice.isdigit() and networks:
+            idx = int(choice)
+            if 1 <= idx <= len(networks):
+                selection = networks[idx - 1]
+                ssid = selection["ssid"]
+                security = selection["security"]
+                break
+        logging.warning("Invalid selection. Try again.")
+
+    password = ""
+    if security == "manual":
+        password = input(f"{style('Wi-Fi password', STYLE_BOLD)} (leave empty for open/saved): ").strip()
+    elif security and security != "--":
+        password = input(f"{style('Wi-Fi password', STYLE_BOLD)} (leave empty to use saved): ").strip()
+    else:
+        if not prompt_yes_no("Open network detected. Connect? [Y/n]: "):
+            return False
+
+    cmd = ["nmcli", "dev", "wifi", "connect", ssid, "ifname", interface]
+    if password:
+        cmd += ["password", password]
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if result.returncode != 0:
+        logging.warning("Failed to connect: %s", result.stderr.strip() or "unknown error")
+        return False
+
+    logging.info(color_text("Connected successfully.", COLOR_SUCCESS))
+    return True
+
+
+def ensure_interface_has_ip(interface: str) -> Optional[Tuple[str, int]]:
+    bring_interface_up(interface)
+    ip_info = get_interface_ipv4(interface)
+    if ip_info:
+        return ip_info
+
+    logging.warning("No IPv4 address found on %s.", interface)
+    if nmcli_available() and prompt_yes_no("Connect to Wi-Fi now? [Y/n]: "):
+        if connect_with_nmcli(interface):
+            time.sleep(3)
+            ip_info = get_interface_ipv4(interface)
+            if ip_info:
+                return ip_info
+
+    input(style("Connect the interface to a network and press Enter to retry.", STYLE_BOLD))
+    return get_interface_ipv4(interface)
 
 
 def select_interface(interfaces: List[str], default_iface: Optional[str]) -> str:
@@ -149,6 +312,28 @@ def prompt_duration() -> Optional[int]:
         logging.warning("Duration must be greater than zero. Using unlimited.")
         return None
     return value
+
+
+def select_bpf_filter() -> Tuple[str, str]:
+    logging.info("")
+    logging.info(style("Capture filter:", STYLE_BOLD))
+    logging.info("  %s", color_text("[1] HTTP only (port 80)", COLOR_HIGHLIGHT))
+    logging.info("  %s", color_text("[2] Common HTTP ports (80, 8080, 8000, 8008, 8888)", COLOR_HIGHLIGHT))
+    logging.info("  %s", color_text("[3] Custom BPF filter", COLOR_HIGHLIGHT))
+
+    choice = input(style("Select option (1-3): ", STYLE_BOLD)).strip()
+    if choice == "2":
+        return (
+            "HTTP ports 80, 8080, 8000, 8008, 8888",
+            "tcp port 80 or tcp port 8080 or tcp port 8000 or tcp port 8008 or tcp port 8888",
+        )
+    if choice == "3":
+        custom = input(style("Enter BPF filter: ", STYLE_BOLD)).strip()
+        if not custom:
+            logging.warning("Empty filter. Using port 80.")
+            return "HTTP only (port 80)", "tcp port 80"
+        return f"Custom ({custom})", custom
+    return "HTTP only (port 80)", "tcp port 80"
 
 
 def safe_decode(value: Optional[bytes]) -> str:
@@ -209,7 +394,7 @@ def packet_handler(packet, state: SnifferState) -> None:
 
 def main() -> None:
     logging.info(color_text("HTTP Sniffer", COLOR_HEADER))
-    logging.info("Capture HTTP requests (port 80)")
+    logging.info("Capture plaintext HTTP requests")
     logging.info("")
 
     if os.geteuid() != 0:
@@ -228,17 +413,26 @@ def main() -> None:
 
     logging.info(style("IMPORTANT:", COLOR_WARNING, STYLE_BOLD))
     logging.info("Use only on networks you own or have explicit permission to test.")
+    logging.info(color_text("Note: HTTPS (443) is encrypted; only plaintext HTTP is decoded.", COLOR_WARNING))
 
     interfaces = list_network_interfaces()
     default_iface = get_default_interface()
     interface = select_interface(interfaces, default_iface)
+
+    ip_info = ensure_interface_has_ip(interface)
+    if not ip_info:
+        logging.warning("Interface %s has no IPv4 address; capture may be empty.", interface)
+        if not prompt_yes_no("Continue anyway? [Y/n]: "):
+            return
+
+    filter_label, bpf_filter = select_bpf_filter()
     duration = prompt_duration()
 
     logging.info("")
     log_handle, log_path = create_log_file("http_sniffer")
     log_event(log_handle, f"Log file: {log_path}", COLOR_SUCCESS)
     log_event(log_handle, f"Interface: {interface}")
-    log_event(log_handle, "Filter: tcp port 80")
+    log_event(log_handle, f"Filter: {filter_label}")
 
     logging.info("")
     logging.info(style("Sniffing started. Press Ctrl+C to stop.", STYLE_BOLD))
@@ -246,7 +440,7 @@ def main() -> None:
     state = SnifferState(log_handle)
     try:
         sniff(
-            filter="tcp port 80",
+            filter=bpf_filter,
             iface=interface,
             prn=lambda pkt: packet_handler(pkt, state),
             store=False,
