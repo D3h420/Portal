@@ -29,6 +29,7 @@ LOG_DIR = os.environ.get("SWISSKNIFE_LOG_DIR", os.path.join(PROJECT_ROOT, "log")
 DEFAULT_HANDSHAKE_DIR = os.environ.get(
     "SWISSKNIFE_HANDSHAKE_DIR", os.path.join(LOG_DIR, "handshakes")
 )
+HANDSHAKER_DEAUTH_VERBOSE = os.environ.get("SWISSKNIFE_HANDSHAKER_DEAUTH_VERBOSE") == "1"
 
 DEFAULT_MONITOR_CHANNELS = (
     list(range(1, 15))
@@ -553,13 +554,23 @@ def run_deauth_background(interface: str, target: Dict[str, Optional[str]], dura
         logging.warning("Deauth module is not available%s; continuing without deauth.", reason)
         return
 
-    logging.info(color_text("\n[DEAUTH] Starting deauthentication attack...", COLOR_WARNING))
+    logging.info(color_text("[DEAUTH] Starting deauthentication attack...", COLOR_WARNING))
 
     try:
-        deauth_running = True
-        success = deauth.start_deauth_attack(interface, target)
+        success = False
+        try:
+            success = deauth.start_deauth_attack(
+                interface,
+                target,
+                quiet=not HANDSHAKER_DEAUTH_VERBOSE,
+            )
+        except TypeError:
+            # Backward-compatible fallback if deauth.py doesn't support quiet mode.
+            success = deauth.start_deauth_attack(interface, target)
+
         if success:
-            logging.info(color_text("Deauth running...", COLOR_SUCCESS))
+            deauth_running = True
+            logging.info(color_text("Deauth active.", COLOR_SUCCESS))
             time.sleep(duration_sec)
         else:
             logging.warning("Failed to start deauth; continuing without it.")
@@ -567,7 +578,10 @@ def run_deauth_background(interface: str, target: Dict[str, Optional[str]], dura
         logging.error("Deauth error: %s", exc)
     finally:
         if deauth_running:
-            deauth.stop_attack()
+            try:
+                deauth.stop_attack(quiet=True)
+            except TypeError:
+                deauth.stop_attack()
             logging.info(color_text("Deauth stopped.", COLOR_SUCCESS))
         deauth_running = False
 
