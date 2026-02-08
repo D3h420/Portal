@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 import os
+import queue
 import re
+import shutil
 import sys
 import time
 import subprocess
 import threading
 import logging
-from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
@@ -98,6 +99,12 @@ def color_text(text: str, color: str) -> str:
 def style(text: str, *styles: str) -> str:
     prefix = "".join(s for s in styles if s)
     return f"{prefix}{text}{COLOR_RESET}" if prefix else text
+
+
+def normalize_mac(mac_address: Optional[str]) -> Optional[str]:
+    if not mac_address:
+        return None
+    return mac_address.strip().lower()
 
 
 def list_network_interfaces() -> List[str]:
@@ -251,6 +258,17 @@ def format_ssid(ssid: str, max_len: int = 24) -> str:
     return cleaned[: max_len - 3].rstrip() + "..."
 
 
+def format_client_list(clients: Set[str], max_items: int = 3) -> str:
+    if not clients:
+        return ""
+    sorted_clients = sorted(clients)
+    if len(sorted_clients) <= max_items:
+        return ", ".join(sorted_clients)
+    remaining = len(sorted_clients) - max_items
+    shown = ", ".join(sorted_clients[:max_items])
+    return f"{shown} +{remaining}"
+
+
 def extract_ssid(packet) -> str:
     if not packet.haslayer(Dot11Elt):
         return "<hidden>"
@@ -339,19 +357,19 @@ def extract_security(packet) -> str:
 
 
 def is_unicast(mac_address: Optional[str]) -> bool:
-    if not mac_address:
+    if not is_valid_mac(mac_address):
         return False
     try:
         first_octet = int(mac_address.split(":")[0], 16)
-    except:
+    except (ValueError, IndexError):
         return False
     return (first_octet & 1) == 0
 
 
 def is_valid_mac(mac_address: Optional[str]) -> bool:
-    if not mac_address:
+    lower = normalize_mac(mac_address)
+    if not lower:
         return False
-    lower = mac_address.lower()
     if lower in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
         return False
     if lower.startswith(("01:00:5e", "01:80:c2", "33:33")):
@@ -379,6 +397,45 @@ class AccessPoint:
             self.channel = new_channel
 
 
+def observe_client_for_ap(aps: Dict[str, AccessPoint], dot11) -> None:
+    """Best-effort client tracking based on 802.11 address roles (ToDS/FromDS)."""
+    addr1 = normalize_mac(getattr(dot11, "addr1", None))
+    addr2 = normalize_mac(getattr(dot11, "addr2", None))
+    addr3 = normalize_mac(getattr(dot11, "addr3", None))
+
+    try:
+        fcfield = int(getattr(dot11, "FCfield", 0))
+    except Exception:
+        fcfield = 0
+
+    to_ds = bool(fcfield & 0x1)
+    from_ds = bool(fcfield & 0x2)
+
+    # Data frames: station <-> AP mapping depends on DS bits.
+    if to_ds and not from_ds:
+        bssid = addr1
+        station = addr2
+        if bssid and station and bssid in aps and station != bssid and is_unicast(station):
+            aps[bssid].clients.add(station)
+        return
+
+    if from_ds and not to_ds:
+        bssid = addr2
+        station = addr1
+        if bssid and station and bssid in aps and station != bssid and is_unicast(station):
+            aps[bssid].clients.add(station)
+        return
+
+    # Management frames: BSSID is typically addr3; station may be addr1 or addr2.
+    if not to_ds and not from_ds:
+        bssid = addr3
+        if not bssid or bssid not in aps:
+            return
+        for station in (addr1, addr2):
+            if station and station != bssid and is_unicast(station):
+                aps[bssid].clients.add(station)
+
+
 def channel_hopper(interface: str, channels: List[int], interval: float, stop_event: threading.Event) -> None:
     if not channels:
         return
@@ -403,9 +460,10 @@ def scan_networks(
     def handle_packet(packet) -> None:
         if not packet.haslayer(Dot11):
             return
+        dot11 = packet[Dot11]
 
         if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
-            bssid = packet[Dot11].addr3
+            bssid = normalize_mac(dot11.addr3)
             if not bssid or not is_valid_mac(bssid):
                 return
             ssid = extract_ssid(packet)
@@ -421,13 +479,8 @@ def scan_networks(
                     ap.update_security(security)
                     ap.update_channel(channel)
 
-        sender = packet.addr2
-        receiver = packet.addr1
         with aps_lock:
-            if sender in aps and is_unicast(receiver):
-                aps[sender].clients.add(receiver)
-            if receiver in aps and is_unicast(sender):
-                aps[receiver].clients.add(sender)
+            observe_client_for_ap(aps, dot11)
 
     sniffer: Optional[AsyncSniffer] = None
     status = "starting"
@@ -507,8 +560,14 @@ def format_network_lines(sorted_aps: List[AccessPoint]) -> List[str]:
         )
         security_label = color_text(ap.security, security_color)
 
+        client_count = len(ap.clients)
+        client_list = format_client_list(ap.clients)
+        client_label = f"clients {client_count}"
+        if client_list:
+            client_label += f" ({client_list})"
+
         label = f"{index}) {ssid_label} ({ap.bssid}) -"
-        details = f"ch {channel_label} | {security_label} | clients {len(ap.clients)}"
+        details = f"ch {channel_label} | {security_label} | {client_label}"
         lines.append(f"  {color_text(label, COLOR_HIGHLIGHT)} {details}")
     return lines
 
@@ -539,51 +598,38 @@ def set_interface_channel(interface: str, channel: int) -> bool:
 def packet_matches_bssid(packet, bssid: str) -> bool:
     if not packet.haslayer(Dot11):
         return False
+    needle = normalize_mac(bssid)
+    if not needle:
+        return False
     dot11 = packet[Dot11]
-    return bssid.lower() in (dot11.addr1 or "", dot11.addr2 or "", dot11.addr3 or "")
+    return needle in {
+        normalize_mac(dot11.addr1),
+        normalize_mac(dot11.addr2),
+        normalize_mac(dot11.addr3),
+    }
+
+def sanitize_capture_basename(ssid: str, fallback: str = "hidden", max_len: int = 24) -> str:
+    if not ssid or ssid in {"<hidden>", "<non-printable>"}:
+        ssid = fallback
+    cleaned = " ".join(str(ssid).split())
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", cleaned).strip("_")
+    if not cleaned:
+        cleaned = fallback
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip("_")
+    return cleaned
 
 
-deauth_running = False
-
-
-def run_deauth_background(interface: str, target: Dict[str, Optional[str]], duration_sec: int = 20):
-    global deauth_running
-
-    if not DEAUTH_AVAILABLE:
-        reason = f" ({DEAUTH_IMPORT_ERROR})" if DEAUTH_IMPORT_ERROR else ""
-        logging.warning("Deauth module is not available%s; continuing without deauth.", reason)
-        return
-
-    logging.info(color_text("[DEAUTH] Starting deauthentication attack...", COLOR_WARNING))
-
-    try:
-        success = False
-        try:
-            success = deauth.start_deauth_attack(
-                interface,
-                target,
-                quiet=not HANDSHAKER_DEAUTH_VERBOSE,
-            )
-        except TypeError:
-            # Backward-compatible fallback if deauth.py doesn't support quiet mode.
-            success = deauth.start_deauth_attack(interface, target)
-
-        if success:
-            deauth_running = True
-            logging.info(color_text("Deauth active.", COLOR_SUCCESS))
-            time.sleep(duration_sec)
-        else:
-            logging.warning("Failed to start deauth; continuing without it.")
-    except Exception as exc:
-        logging.error("Deauth error: %s", exc)
-    finally:
-        if deauth_running:
-            try:
-                deauth.stop_attack(quiet=True)
-            except TypeError:
-                deauth.stop_attack()
-            logging.info(color_text("Deauth stopped.", COLOR_SUCCESS))
-        deauth_running = False
+def next_handshake_pcap_path(output_dir: str, ssid: str) -> str:
+    base = sanitize_capture_basename(ssid)
+    first = os.path.join(output_dir, f"{base}.pcap")
+    if not os.path.exists(first):
+        return first
+    for index in range(2, 10000):
+        candidate = os.path.join(output_dir, f"{base}_{index}.pcap")
+        if not os.path.exists(candidate):
+            return candidate
+    return os.path.join(output_dir, f"{base}_{int(time.time())}.pcap")
 
 
 def capture_full_handshakes(
@@ -595,10 +641,7 @@ def capture_full_handshakes(
 ) -> Optional[Dict]:
     os.makedirs(output_dir, exist_ok=True)
 
-    bssid_clean = ap.bssid.replace(":", "")
-    ssid_clean = re.sub(r'[^A-Za-z0-9_-]', '_', ap.ssid or "hidden")[:32]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pcap_path = os.path.join(output_dir, f"handshake_{bssid_clean}_{ssid_clean}_{timestamp}.pcap")
+    pcap_path = next_handshake_pcap_path(output_dir, ap.ssid)
 
     writer = None
     sniffer = None
@@ -611,6 +654,34 @@ def capture_full_handshakes(
 
     start_time: Optional[float] = None
     started = False
+    interrupted = False
+
+    stats_lock = threading.Lock()
+    events: "queue.SimpleQueue[tuple[Optional[str], str]]" = queue.SimpleQueue()
+
+    def terminal_columns() -> int:
+        try:
+            return max(40, int(shutil.get_terminal_size((80, 20)).columns))
+        except Exception:
+            return 80
+
+    def clear_status_line() -> None:
+        if not sys.stdout.isatty():
+            return
+        width = terminal_columns()
+        sys.stdout.write("\r" + (" " * (width - 1)) + "\r")
+        sys.stdout.flush()
+
+    def render_status_line(text: str) -> None:
+        if not sys.stdout.isatty():
+            return
+        width = terminal_columns()
+        sys.stdout.write("\r" + text.ljust(width - 1)[: width - 1])
+        sys.stdout.flush()
+
+    def emit_event(message: str, color: Optional[str] = None) -> None:
+        clear_status_line()
+        logging.info(color_text(message, color) if color else message)
 
     try:
         writer = PcapWriter(pcap_path, append=False, sync=True)
@@ -621,29 +692,41 @@ def capture_full_handshakes(
             if not pkt.haslayer(Dot11):
                 return
 
-            total_packets += 1
+            with stats_lock:
+                total_packets += 1
 
             # Write every packet to PCAP (filter later in Wireshark).
             writer.write(pkt)
 
             if pkt.haslayer(EAPOL):
-                eapol_count += 1
+                with stats_lock:
+                    eapol_count += 1
                 if packet_matches_bssid(pkt, ap.bssid):
-                    client = pkt.addr1 if pkt.addr1 != ap.bssid else pkt.addr2
-                    if client and is_valid_mac(client):
+                    dot11 = pkt[Dot11]
+                    bssid = normalize_mac(ap.bssid)
+                    addr1 = normalize_mac(dot11.addr1)
+                    addr2 = normalize_mac(dot11.addr2)
+
+                    client = None
+                    for candidate in (addr1, addr2):
+                        if candidate and candidate != bssid and is_unicast(candidate):
+                            client = candidate
+                            break
+                    if not client:
+                        return
+
+                    with stats_lock:
                         clients_with_eapol.add(client)
-                        if client not in eapol_states:
-                            eapol_states[client] = 0
-                        eapol_states[client] += 1
+                        eapol_states[client] = eapol_states.get(client, 0) + 1
 
                         # Very simple heuristic: 4 consecutive EAPOL messages -> likely full 4-way handshake.
                         if eapol_states[client] >= 4:
                             handshake_count += 1
                             eapol_states[client] = 0  # Reset counter after a likely complete handshake.
-                            logging.info(
-                                color_text(
-                                    f"[+] Possible complete 4-way handshake detected (client: {client})",
+                            events.put(
+                                (
                                     COLOR_SUCCESS,
+                                    f"[+] Possible complete 4-way handshake detected (client: {client})",
                                 )
                             )
 
@@ -653,20 +736,33 @@ def capture_full_handshakes(
         start_time = time.time()
         started = True
 
-        # Start deauth in a background thread.
         target_dict = {
             "bssid": ap.bssid,
             "ssid": ap.ssid,
             "channel": ap.channel,
         }
 
-        if deauth_duration_sec > 0:
-            deauth_thread = threading.Thread(
-                target=run_deauth_background,
-                args=(interface, target_dict, deauth_duration_sec),
-                daemon=True,
-            )
-            deauth_thread.start()
+        deauth_started = False
+        deauth_stop_at: Optional[float] = None
+
+        if deauth_duration_sec > 0 and DEAUTH_AVAILABLE:
+            emit_event("[DEAUTH] Starting deauthentication attack...", COLOR_WARNING)
+            success = False
+            try:
+                success = deauth.start_deauth_attack(
+                    interface,
+                    target_dict,
+                    quiet=not HANDSHAKER_DEAUTH_VERBOSE,
+                )
+            except TypeError:
+                success = deauth.start_deauth_attack(interface, target_dict)
+
+            if success:
+                deauth_started = True
+                deauth_stop_at = start_time + max(1, int(deauth_duration_sec))
+                emit_event("[DEAUTH] Active.", COLOR_SUCCESS)
+            else:
+                emit_event("[DEAUTH] Failed to start; continuing without it.", COLOR_WARNING)
 
         # Main capture loop.
         while True:
@@ -675,26 +771,59 @@ def capture_full_handshakes(
             if remaining <= 0:
                 break
 
-            status = f"Capture: {elapsed}s / {total_duration_sec}s   EAPOL: {eapol_count}   Handshakes: {handshake_count}"
-            print(f"\r{status.ljust(80)}", end="", flush=True)
+            if deauth_started and deauth_stop_at and time.time() >= deauth_stop_at:
+                try:
+                    deauth.stop_attack(quiet=True)
+                except TypeError:
+                    deauth.stop_attack()
+                deauth_started = False
+                emit_event("[DEAUTH] Stopped.", COLOR_SUCCESS)
+
+            # Drain asynchronous events (handshake detections).
+            while True:
+                try:
+                    color, message = events.get(block=False)
+                except queue.Empty:
+                    break
+                emit_event(message, color)
+
+            with stats_lock:
+                eapol_snapshot = eapol_count
+                handshake_snapshot = handshake_count
+
+            status = (
+                f"Capture: {elapsed}s / {total_duration_sec}s   "
+                f"EAPOL: {eapol_snapshot}   Handshakes: {handshake_snapshot}"
+            )
+            render_status_line(status)
             time.sleep(1)
 
     except KeyboardInterrupt:
-        logging.info("\nInterrupted by user (Ctrl+C).")
+        interrupted = True
     except Exception as exc:
+        clear_status_line()
         logging.error("Capture failed: %s", exc)
         return None
     finally:
+        clear_status_line()
         if sniffer:
             try:
                 sniffer.stop()
             except:
                 pass
+        if DEAUTH_AVAILABLE:
+            try:
+                deauth.stop_attack(quiet=True)
+            except TypeError:
+                try:
+                    deauth.stop_attack()
+                except Exception:
+                    pass
         if writer:
             writer.close()
 
-        # Ensure we end the live "\r" progress line cleanly.
-        print("")
+        if interrupted:
+            logging.info("Interrupted by user (Ctrl+C).")
 
         if started:
             duration_sec = int(time.time() - (start_time or time.time()))

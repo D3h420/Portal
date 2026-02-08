@@ -639,6 +639,12 @@ def extract_encryption(packet) -> str:
     return finalize_encryption(privacy, wpa, wpa2, wps)
 
 
+def normalize_mac(mac_address: Optional[str]) -> Optional[str]:
+    if not mac_address:
+        return None
+    return mac_address.strip().lower()
+
+
 def is_unicast(mac_address: Optional[str]) -> bool:
     if not is_valid_mac(mac_address):
         return False
@@ -650,9 +656,9 @@ def is_unicast(mac_address: Optional[str]) -> bool:
 
 
 def is_valid_mac(mac_address: Optional[str]) -> bool:
-    if not mac_address:
+    lower = normalize_mac(mac_address)
+    if not lower:
         return False
-    lower = mac_address.lower()
     if lower in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
         return False
     if lower.startswith(("01:00:5e", "01:80:c2", "33:33")):
@@ -660,6 +666,45 @@ def is_valid_mac(mac_address: Optional[str]) -> bool:
     if len(lower.split(":")) != 6:
         return False
     return True
+
+
+def observe_client_for_ap(aps: Dict[str, "AccessPoint"], dot11) -> None:
+    """Best-effort client tracking based on 802.11 address roles (ToDS/FromDS)."""
+    addr1 = normalize_mac(getattr(dot11, "addr1", None))
+    addr2 = normalize_mac(getattr(dot11, "addr2", None))
+    addr3 = normalize_mac(getattr(dot11, "addr3", None))
+
+    try:
+        fcfield = int(getattr(dot11, "FCfield", 0))
+    except Exception:
+        fcfield = 0
+
+    to_ds = bool(fcfield & 0x1)
+    from_ds = bool(fcfield & 0x2)
+
+    # Data frames: station <-> AP mapping depends on DS bits.
+    if to_ds and not from_ds:
+        bssid = addr1
+        station = addr2
+        if bssid and station and bssid in aps and station != bssid and is_unicast(station):
+            aps[bssid].clients.add(station)
+        return
+
+    if from_ds and not to_ds:
+        bssid = addr2
+        station = addr1
+        if bssid and station and bssid in aps and station != bssid and is_unicast(station):
+            aps[bssid].clients.add(station)
+        return
+
+    # Management frames: BSSID is typically addr3; station may be addr1 or addr2.
+    if not to_ds and not from_ds:
+        bssid = addr3
+        if not bssid or bssid not in aps:
+            return
+        for station in (addr1, addr2):
+            if station and station != bssid and is_unicast(station):
+                aps[bssid].clients.add(station)
 
 
 @dataclass
@@ -721,8 +766,9 @@ def scan_wireless_networks_scapy(
         if not packet.haslayer(Dot11):
             return
 
+        dot11 = packet[Dot11]
         if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
-            bssid = packet[Dot11].addr3
+            bssid = normalize_mac(dot11.addr3)
             if not bssid or not is_valid_mac(bssid):
                 return
             ssid, _hidden = extract_ssid(packet)
@@ -755,13 +801,8 @@ def scan_wireless_networks_scapy(
                         ap.encryption = encryption
                     ap.update_signal(rssi)
 
-        sender = packet.addr2
-        receiver = packet.addr1
         with aps_lock:
-            if sender in aps and is_unicast(receiver):
-                aps[sender].clients.add(receiver)
-            if receiver in aps and is_unicast(sender):
-                aps[receiver].clients.add(sender)
+            observe_client_for_ap(aps, dot11)
 
     stop_event = threading.Event()
     hopper_thread: Optional[threading.Thread] = None
@@ -987,8 +1028,9 @@ def run_sniffer(
         if not packet.haslayer(Dot11):
             return
 
+        dot11 = packet[Dot11]
         if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
-            bssid = packet[Dot11].addr3
+            bssid = normalize_mac(dot11.addr3)
             if not bssid or not is_valid_mac(bssid):
                 return
             ssid, _hidden = extract_ssid(packet)
@@ -1028,13 +1070,8 @@ def run_sniffer(
                     probe_counts[ssid] = probe_counts.get(ssid, 0) + 1
                     state.probe_total += 1
 
-        sender = packet.addr2
-        receiver = packet.addr1
         with aps_lock:
-            if sender in aps and is_unicast(receiver):
-                aps[sender].clients.add(receiver)
-            if receiver in aps and is_unicast(sender):
-                aps[receiver].clients.add(sender)
+            observe_client_for_ap(aps, dot11)
 
     sniffer: Optional[AsyncSniffer] = None
     status = "starting"
