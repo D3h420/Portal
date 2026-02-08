@@ -195,6 +195,14 @@ def set_interface_type(interface: str, mode: str) -> bool:
             logging.error("Failed to set %s mode: %s", mode, result.stderr.strip() or "unknown error")
             return False
         subprocess.run(["ip", "link", "set", interface, "up"], check=False, stderr=subprocess.DEVNULL)
+        if mode == "monitor":
+            # Best-effort: some drivers require this to capture frames from other BSSIDs.
+            subprocess.run(
+                ["iw", "dev", interface, "set", "monitor", "otherbss"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
         time.sleep(0.5)
         return True
     except Exception as exc:
@@ -669,10 +677,64 @@ def is_valid_mac(mac_address: Optional[str]) -> bool:
 
 
 def observe_client_for_ap(aps: Dict[str, "AccessPoint"], dot11) -> None:
-    """Best-effort client tracking based on 802.11 address roles (ToDS/FromDS)."""
+    """Track associated clients (stations) per AP.
+
+    We count *associated* clients only from DATA frames (type=2). Management
+    frames (probe/auth/assoc) are not stable indicators of association and are
+    intentionally excluded from the main client count.
+
+    Robustness:
+    - Uses ToDS/FromDS when available.
+    - Falls back to matching known BSSIDs in addr1/addr2 when flags are unreliable.
+    """
+    if not dot11:
+        return
+
+    frame_type = getattr(dot11, "type", None)
+
     addr1 = normalize_mac(getattr(dot11, "addr1", None))
     addr2 = normalize_mac(getattr(dot11, "addr2", None))
     addr3 = normalize_mac(getattr(dot11, "addr3", None))
+
+    # Management frames (probe/auth/assoc/etc.) can help with visibility, but we
+    # keep them separate from the "associated clients" count.
+    if frame_type == 0:
+        subtype = getattr(dot11, "subtype", None)
+        bssid = addr3
+
+        def add_station(target_bssid: Optional[str], station: Optional[str], *, probe: bool = False) -> None:
+            if not target_bssid or target_bssid not in aps:
+                return
+            if not station or station == target_bssid or not is_unicast(station):
+                return
+            if probe:
+                aps[target_bssid].probing_stations.add(station)
+            else:
+                aps[target_bssid].seen_stations.add(station)
+
+        # 802.11 management subtypes
+        # 0 assoc req, 1 assoc resp, 2 reassoc req, 3 reassoc resp, 4 probe req, 5 probe resp,
+        # 8 beacon, 10 disassoc, 11 auth, 12 deauth
+        if subtype in (0, 2, 10, 11, 12):
+            # STA -> AP (usually). addr2 is the STA, addr3 is the BSSID/AP.
+            add_station(bssid, addr2)
+            return
+        if subtype in (1, 3):
+            # AP -> STA (usually). addr1 is the STA, addr3 is the BSSID/AP.
+            add_station(bssid, addr1)
+            return
+        if subtype == 4:
+            # Probe request. addr2 is the STA. addr3 may be broadcast or a directed BSSID.
+            add_station(bssid, addr2, probe=True)
+            return
+        if subtype == 5:
+            # Probe response. addr1 is the STA, addr3 is the BSSID/AP.
+            add_station(bssid, addr1, probe=True)
+            return
+        return
+
+    if frame_type != 2:
+        return
 
     try:
         fcfield = int(getattr(dot11, "FCfield", 0))
@@ -682,29 +744,40 @@ def observe_client_for_ap(aps: Dict[str, "AccessPoint"], dot11) -> None:
     to_ds = bool(fcfield & 0x1)
     from_ds = bool(fcfield & 0x2)
 
-    # Data frames: station <-> AP mapping depends on DS bits.
+    bssid: Optional[str] = None
+    station: Optional[str] = None
+
     if to_ds and not from_ds:
+        # STA -> AP
         bssid = addr1
         station = addr2
-        if bssid and station and bssid in aps and station != bssid and is_unicast(station):
-            aps[bssid].clients.add(station)
-        return
-
-    if from_ds and not to_ds:
+    elif from_ds and not to_ds:
+        # AP -> STA
         bssid = addr2
         station = addr1
-        if bssid and station and bssid in aps and station != bssid and is_unicast(station):
-            aps[bssid].clients.add(station)
+    elif not to_ds and not from_ds:
+        # IBSS/ad-hoc (no DS). Treat addr3 as "network id" and addr2 as a station.
+        bssid = addr3
+        station = addr2
+    else:
+        # WDS/mesh (4-address) frames: no single BSSID; ignore for association counting.
         return
 
-    # Management frames: BSSID is typically addr3; station may be addr1 or addr2.
-    if not to_ds and not from_ds:
-        bssid = addr3
-        if not bssid or bssid not in aps:
-            return
-        for station in (addr1, addr2):
-            if station and station != bssid and is_unicast(station):
-                aps[bssid].clients.add(station)
+    # Fallback: if flags are unreliable, try to match known BSSIDs in addr1/addr2.
+    if bssid not in aps:
+        if addr1 and addr1 in aps:
+            bssid = addr1
+            station = addr2
+        elif addr2 and addr2 in aps:
+            bssid = addr2
+            station = addr1
+
+    if not bssid or bssid not in aps:
+        return
+    if not station or station == bssid or not is_unicast(station):
+        return
+
+    aps[bssid].clients.add(station)
 
 
 @dataclass
@@ -717,6 +790,8 @@ class AccessPoint:
     rssi: Optional[int]
     signal: Optional[int]
     clients: Set[str] = field(default_factory=set)
+    seen_stations: Set[str] = field(default_factory=set)
+    probing_stations: Set[str] = field(default_factory=set)
 
     def update_signal(self, new_rssi: Optional[int]) -> None:
         new_signal = rssi_to_quality(new_rssi)
@@ -762,13 +837,21 @@ def scan_wireless_networks_scapy(
     aps: Dict[str, AccessPoint] = {}
     aps_lock = threading.Lock()
 
+    # Best-effort: ensure monitor capture includes other BSS traffic.
+    subprocess.run(
+        ["iw", "dev", interface, "set", "monitor", "otherbss"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
     def handle_packet(packet) -> None:
         if not packet.haslayer(Dot11):
             return
 
         dot11 = packet[Dot11]
         if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
-            bssid = normalize_mac(dot11.addr3)
+            bssid = normalize_mac(dot11.addr3 or dot11.addr2)
             if not bssid or not is_valid_mac(bssid):
                 return
             ssid, _hidden = extract_ssid(packet)
@@ -1021,6 +1104,14 @@ def run_sniffer(
     probe_counts = state.probe_counts
     aps_lock = threading.Lock()
 
+    # Best-effort: ensure monitor capture includes other BSS traffic.
+    subprocess.run(
+        ["iw", "dev", interface, "set", "monitor", "otherbss"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
     def handle_packet(packet) -> None:
         with aps_lock:
             state.packet_count += 1
@@ -1030,7 +1121,7 @@ def run_sniffer(
 
         dot11 = packet[Dot11]
         if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
-            bssid = normalize_mac(dot11.addr3)
+            bssid = normalize_mac(dot11.addr3 or dot11.addr2)
             if not bssid or not is_valid_mac(bssid):
                 return
             ssid, _hidden = extract_ssid(packet)

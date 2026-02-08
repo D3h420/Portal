@@ -31,6 +31,7 @@ DEFAULT_HANDSHAKE_DIR = os.environ.get(
     "SWISSKNIFE_HANDSHAKE_DIR", os.path.join(LOG_DIR, "handshakes")
 )
 HANDSHAKER_DEAUTH_VERBOSE = os.environ.get("SWISSKNIFE_HANDSHAKER_DEAUTH_VERBOSE") == "1"
+DEBUG_CLIENTS = os.environ.get("SWISSKNIFE_DEBUG_CLIENTS") == "1"
 
 DEFAULT_MONITOR_CHANNELS = (
     list(range(1, 15))
@@ -189,6 +190,14 @@ def set_interface_type(interface: str, mode: str) -> bool:
             logging.error("Failed to set %s mode: %s", mode, result.stderr.strip() or "unknown error")
             return False
         subprocess.run(["ip", "link", "set", interface, "up"], check=False, stderr=subprocess.DEVNULL)
+        if mode == "monitor":
+            # Best-effort: some drivers require this to capture frames from other BSSIDs.
+            subprocess.run(
+                ["iw", "dev", interface, "set", "monitor", "otherbss"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
         time.sleep(0.5)
         return True
     except Exception as exc:
@@ -386,6 +395,8 @@ class AccessPoint:
     security: str
     channel: Optional[int] = None
     clients: Set[str] = field(default_factory=set)
+    seen_stations: Set[str] = field(default_factory=set)
+    probing_stations: Set[str] = field(default_factory=set)
 
     def update_security(self, new_security: str) -> None:
         priority = {"OPEN": 0, "WEP": 1, "WPA": 2, "WPA2": 3, "WPA3": 4}
@@ -398,10 +409,64 @@ class AccessPoint:
 
 
 def observe_client_for_ap(aps: Dict[str, AccessPoint], dot11) -> None:
-    """Best-effort client tracking based on 802.11 address roles (ToDS/FromDS)."""
+    """Track associated clients (stations) per AP.
+
+    We count *associated* clients only from DATA frames (type=2). Management
+    frames (probe/auth/assoc) are not stable indicators of association and are
+    intentionally excluded from the main client count.
+
+    Robustness:
+    - Uses ToDS/FromDS when available.
+    - Falls back to matching known BSSIDs in addr1/addr2 when flags are unreliable.
+    """
+    if not dot11:
+        return
+
+    frame_type = getattr(dot11, "type", None)
+
     addr1 = normalize_mac(getattr(dot11, "addr1", None))
     addr2 = normalize_mac(getattr(dot11, "addr2", None))
     addr3 = normalize_mac(getattr(dot11, "addr3", None))
+
+    # Management frames (probe/auth/assoc/etc.) can help with visibility, but we
+    # keep them separate from the "associated clients" count.
+    if frame_type == 0:
+        subtype = getattr(dot11, "subtype", None)
+        bssid = addr3
+
+        def add_station(target_bssid: Optional[str], station: Optional[str], *, probe: bool = False) -> None:
+            if not target_bssid or target_bssid not in aps:
+                return
+            if not station or station == target_bssid or not is_unicast(station):
+                return
+            if probe:
+                aps[target_bssid].probing_stations.add(station)
+            else:
+                aps[target_bssid].seen_stations.add(station)
+
+        # 802.11 management subtypes
+        # 0 assoc req, 1 assoc resp, 2 reassoc req, 3 reassoc resp, 4 probe req, 5 probe resp,
+        # 8 beacon, 10 disassoc, 11 auth, 12 deauth
+        if subtype in (0, 2, 10, 11, 12):
+            # STA -> AP (usually). addr2 is the STA, addr3 is the BSSID/AP.
+            add_station(bssid, addr2)
+            return
+        if subtype in (1, 3):
+            # AP -> STA (usually). addr1 is the STA, addr3 is the BSSID/AP.
+            add_station(bssid, addr1)
+            return
+        if subtype == 4:
+            # Probe request. addr2 is the STA. addr3 may be broadcast or a directed BSSID.
+            add_station(bssid, addr2, probe=True)
+            return
+        if subtype == 5:
+            # Probe response. addr1 is the STA, addr3 is the BSSID/AP.
+            add_station(bssid, addr1, probe=True)
+            return
+        return
+
+    if frame_type != 2:
+        return
 
     try:
         fcfield = int(getattr(dot11, "FCfield", 0))
@@ -411,29 +476,40 @@ def observe_client_for_ap(aps: Dict[str, AccessPoint], dot11) -> None:
     to_ds = bool(fcfield & 0x1)
     from_ds = bool(fcfield & 0x2)
 
-    # Data frames: station <-> AP mapping depends on DS bits.
+    bssid: Optional[str] = None
+    station: Optional[str] = None
+
     if to_ds and not from_ds:
+        # STA -> AP
         bssid = addr1
         station = addr2
-        if bssid and station and bssid in aps and station != bssid and is_unicast(station):
-            aps[bssid].clients.add(station)
-        return
-
-    if from_ds and not to_ds:
+    elif from_ds and not to_ds:
+        # AP -> STA
         bssid = addr2
         station = addr1
-        if bssid and station and bssid in aps and station != bssid and is_unicast(station):
-            aps[bssid].clients.add(station)
+    elif not to_ds and not from_ds:
+        # IBSS/ad-hoc (no DS). Treat addr3 as "network id" and addr2 as a station.
+        bssid = addr3
+        station = addr2
+    else:
+        # WDS/mesh (4-address) frames: no single BSSID; ignore for association counting.
         return
 
-    # Management frames: BSSID is typically addr3; station may be addr1 or addr2.
-    if not to_ds and not from_ds:
-        bssid = addr3
-        if not bssid or bssid not in aps:
-            return
-        for station in (addr1, addr2):
-            if station and station != bssid and is_unicast(station):
-                aps[bssid].clients.add(station)
+    # Fallback: if flags are unreliable, try to match known BSSIDs in addr1/addr2.
+    if bssid not in aps:
+        if addr1 and addr1 in aps:
+            bssid = addr1
+            station = addr2
+        elif addr2 and addr2 in aps:
+            bssid = addr2
+            station = addr1
+
+    if not bssid or bssid not in aps:
+        return
+    if not station or station == bssid or not is_unicast(station):
+        return
+
+    aps[bssid].clients.add(station)
 
 
 def channel_hopper(interface: str, channels: List[int], interval: float, stop_event: threading.Event) -> None:
@@ -456,14 +532,36 @@ def scan_networks(
 ) -> Dict[str, AccessPoint]:
     aps: Dict[str, AccessPoint] = {}
     aps_lock = threading.Lock()
+    debug_total = 0
+    debug_mgmt = 0
+    debug_ctrl = 0
+    debug_data = 0
+    debug_data_known = 0
+
+    # Best-effort: ensure monitor capture includes other BSS traffic.
+    subprocess.run(
+        ["iw", "dev", interface, "set", "monitor", "otherbss"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
     def handle_packet(packet) -> None:
+        nonlocal debug_total, debug_mgmt, debug_ctrl, debug_data, debug_data_known
         if not packet.haslayer(Dot11):
             return
         dot11 = packet[Dot11]
 
+        debug_total += 1
+        if getattr(dot11, "type", None) == 0:
+            debug_mgmt += 1
+        elif getattr(dot11, "type", None) == 1:
+            debug_ctrl += 1
+        elif getattr(dot11, "type", None) == 2:
+            debug_data += 1
+
         if packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp):
-            bssid = normalize_mac(dot11.addr3)
+            bssid = normalize_mac(dot11.addr3 or dot11.addr2)
             if not bssid or not is_valid_mac(bssid):
                 return
             ssid = extract_ssid(packet)
@@ -480,6 +578,11 @@ def scan_networks(
                     ap.update_channel(channel)
 
         with aps_lock:
+            if getattr(dot11, "type", None) == 2:
+                a1 = normalize_mac(getattr(dot11, "addr1", None))
+                a2 = normalize_mac(getattr(dot11, "addr2", None))
+                if (a1 and a1 in aps) or (a2 and a2 in aps):
+                    debug_data_known += 1
             observe_client_for_ap(aps, dot11)
 
     sniffer: Optional[AsyncSniffer] = None
@@ -534,6 +637,18 @@ def scan_networks(
 
     if hopper_thread:
         hopper_thread.join(timeout=2)
+
+    if DEBUG_CLIENTS:
+        logging.info("")
+        logging.info(style("Client debug:", STYLE_BOLD))
+        logging.info(
+            "  Dot11 frames: %d | mgmt: %d | ctrl: %d | data: %d",
+            debug_total,
+            debug_mgmt,
+            debug_ctrl,
+            debug_data,
+        )
+        logging.info("  Data frames with known BSSID (addr1/addr2): %d", debug_data_known)
 
     return aps
 
